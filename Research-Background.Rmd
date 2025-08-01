@@ -1,0 +1,110 @@
+---
+title             : "**Inequality-Driven Socio-Economic Origins of Industrial Emissions and The Resultant Transboundary Corollaries of Acid Rain in Forest Ecosystems**"
+shorttitle        : "Emissions/Inequality Research Project"
+
+author: 
+  - name          : "Suzanne Pierre"
+    affiliation   : "1"
+    corresponding : yes    # Define corresponding author
+    address       : "887 Sonoma Ave Unit 23 Santa Rosa, CA 95404"
+    email         : "spierre.cel@gmail.com"
+    role: # Contributorship roles: https://credit.niso.org/
+      - "Project administration"
+      - "Conceptualization"
+      - "Writing - Original Draft Preparation"
+      - "Writing - Review & Editing"
+      - "Supervision"
+  - name          : "Pa-Shun D. Hawkins"
+    affiliation   : "1,2"
+    role:
+      - "Conceptualization"
+      - "Writing - Original Draft Preparation"
+      - "Writing - Review & Editing"
+      - "Data curation"
+      - "Methodology"
+      - "Formal analysis"
+      - "Visualization"
+  - name          : "Robert J. Dellinger"
+    affiliation   : "1,3"
+    role:
+      - "Conceptualization"
+      - "Writing - Original Draft Preparation"
+      - "Writing - Review & Editing"
+      - "Data curation"
+      - "Methodology"
+      - "Formal analysis"
+      - "Visualization"
+      
+affiliation:
+  - id            : "1"
+    institution   : "Critical Ecology Lab, Independent Research & 501(c)3 Nonprofit Organization"
+  - id            : "2"
+    institution   : "Institute of the Environment and Sustainability, University of California, Los Angeles"
+  - id            : "3"
+    institution   : "Department of Atmospheric and Oceanic Sciences, University of California, Los Angeles"
+    
+authornote: |
+  We gratefully acknowledge the Hubbard Brook Long Term Ecological Research (LTER) program for access to long-term ecological observations and data products. We also thank the U.S. Environmental Protection Agency for public access to emissions datasets, including the National Emissions Inventory (NEI) and the Clean Air Markets Division Acid Rain Program (ARP). Digitized HOLC “Residential Security” maps were obtained from the Mapping Inequality: Redlining in New Deal America project (Digital Scholarship Lab), and measures of social vulnerability were derived from the CDC/ATSDR Social Vulnerability Index (SVI).
+
+abstract: |
+   This study explores the intersection of socio-economic inequality and industrial emissions, with a focus on socio-economic and racial stratification as a key driver of environmental degradation, particularly acid rain, in forest ecosystems. We hypothesize that regions with higher socio-economic inequality, especially those with a significant racial wealth gap, are disproportionately impacted by industrial emissions, which contribute to acid rain. Our analysis integrates emissions data from the EPA National Emissions Inventory and Acid Rain Program, wealth inequality data from Census records, and long-term ecological data from the NSF LTER network.
+  
+keywords          : "Industrial emissions, Acid rain, Sulfur dioxide (SO2), Nitrogen oxides (NOx), Clean Air Act Amendments, Acid Rain Program, Redlining (HOLC), Racial wealth gap, Social Vulnerability Index (SVI), Transboundary pollution, Atmospheric deposition, Biogeochemical cycling, Hubbard Brook Experimental Forest, Spatial analysis"
+
+bibliography      : "References.bib"
+link-citations    : true
+keep-tex          : false
+floatsintext      : no
+linenumbers       : no
+draft             : no
+mask              : no
+
+figurelist        : no
+tablelist         : no
+footnotelist      : no
+
+classoption       : "jou"
+output:
+  papaja::apa6_pdf:
+    latex_engine: xelatex
+header-includes:
+  - \usepackage[version=4]{mhchem}
+  - \usepackage{float}
+---
+
+```{r setup, include = FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(pacman)
+
+# Load necessary libraries
+pacman::p_load(tidyvers, sf, DT, ggplot2, dplyr, readr, readxl, tidyr, ggthemes, ggpubr, gganimate,
+               rnaturalearth, rnaturalearthdata, tigris, here, ipumsr, rmarkdown, htmltools, shiny,
+               reshape2, gmp, papaja, multcompView, reshape2, car, plotly)
+
+# Anchor project root so 'here' resolves correctly when knitting
+try(here::i_am("Research-Background.Rmd"), silent = TRUE)
+
+```
+
+
+# Introduction
+
+Air pollution is not placed randomly; its sources follow geographies of exclusion, marked by notions of race and class, and sedimented through decades of policy decisions [@hailemariamcarbonemissions; @schellsystemicracism]. One of the most enduring cartographies of these injustices is inscribed within the U.S . Federal Government’s Home Owners’ Loan Corporation (HOLC) “Residential Security” maps from the 1930s, which institutionalized racial segregation through ranking mortgage risk ratings and providing specific locations for investments of industrial activity [@nelsonmappinginequality]. Nearly a century later, these maps continue to predict where environmental hazards and harms concentrate and where they don’t [@desrochessocioeco; @estienhistoricalredlining; @tessumracialdisparitiespm25].
+
+One of the most well-known atmospheric hazards of the late 20th century is acid rain, primarily driven by sulfur dioxide (\ce{SO2}) and nitrogen oxide (\ce{NOx}) emissions from fossil-fuel-powered electric utilities and coal burning activities [@driscollacidrain]. Hubbard Brook Experimental Forest in New Hampshire became the primary site for documenting the biogeochemical consequences of these emissions for decades. Long-term monitoring at Hubbard Brook provided the first empirical evidence that acidic deposition from upwind sources was altering soil chemistry and restructuring forest ecosystems. It was here that the link between distant emissions and local ecological degradation was scientifically grounded and studied through isotope geochemistry, catalyzing the 1990 Clean Air Act Amendments (CAAA) and the establishment of the Acid Rain Program (ARP) -the first cap and trade system for atmospheric pollutants [@driscollacidrain; @likensdiscoveryacidrain; @likenscenturychange; @mitchellstableisotopes] But while the research at Hubbard Brook clarified the where and what of acid rain, it left open the who and why? Who lives downwind of these emissions, and why are those locations chosen?
+
+
+This study interrogates the intersection of historical segregation, contemporary inequality, and the geography of atmospheric pollution to ask: **Does structural inequality shape the sources and quantity of emissions that contribute to acid rain?** Our hypotheses are two-fold. First, we hypothesize that areas of higher social vulnerability (e.g, lower median household income), will exhibit higher emissions per census tract. Second, we hypothesize that power plant pollution continues to fall disproportionately on neighborhoods historically graded “hazardous” (D) or “declining” (C) by HOLC due to structural conditions that rendered these areas as politically marginal and economically expendable. To test this, we integrate long-term \ce{SO2} and \ce{NOx} emissions data from the EPA National Emissions Inventory (NEI) and the EPA ARP with digitized HOLC maps and the CDC’s Social Vulnerability Index. This spatial synthesis allows us to trace not only the environmental consequences of polluting industries but also the racial and economic geographies that shape their placement and persistence. Our analytical anchor remains the northeastern U.S., particularly the states implicated in emissions transport to Hubbard Brook, where isotopic signatures of acid deposition have been traced to seven states of interest. By situating Hubbard Brook within a broader socio-political context, we intend to reframe acid rain as not merely an ecological consequence, but as a spatialized expression of inequality-based emissions. In telling this story, we aim to expand the narrative of atmospheric science: from one focused solely on emissions and deposition to one that reckons with the social drivers of environmental change. 
+
+
+```{r visual-abstract, echo=FALSE, message=FALSE, warning=FALSE, fig.scap = "Social drivers of emissions and acid-rain deposition.", fig.cap  = "Social drivers of emissions and contributions to acid-rain deposition. The left panel (stacked layers) depicts how structural racism and classed systems shape urban biophysical conditions (e.g., landscape heterogeneity, disease dynamics, resource distribution, pollutants, green space/tree cover, urban heat, impervious surfaces), which in turn influence emission sources. The right panel illustrates emissions, atmospheric transport and deposition, and formation of acid rain, with downstream effects on soils and waters.", fig.align = "center", out.width = "100%", fig.pos="H"}
+
+p <- here::here("Figures", "CEL_Visual_Abstract.png")
+if (!file.exists(p)) p <- "/mnt/data/CEL_Visual_Abstract.png"  # fallback during testing
+knitr::include_graphics(p)
+```
+
+
+::: {#refs custom-style="Bibliography"}
+:::
