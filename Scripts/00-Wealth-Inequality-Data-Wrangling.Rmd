@@ -1,0 +1,625 @@
+---
+title: "**Data Wrangling: Wealth Inequality**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+header-includes:
+  - |
+    <style>
+      pre, code { font-size: 0.9em; line-height: 1.3; }
+    </style>
+---
+
+
+
+## Setup Packages
+
+```{r setup-packages, include=FALSE}
+
+# Set up the environment and clear the workspace
+rm(list = ls())
+
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+library(pacman)
+
+pacman::p_load(
+  tidyverse,     # includes dplyr, ggplot2, readr, stringr, tidyr, etc.
+  janitor,       # clean_names etc.
+  glue, here,    # paths and string glueing
+  viridis,       # color scales
+  ineq,          # Gini coefficient
+  sf, tigris,    # spatial joins and shapefiles
+  scales,        # percent_format / number_format
+  ggrepel,       # better labels if you use them
+  kableExtra,    # table styling (or gt if you prefer)
+  knitr, rmarkdown, tinytex, sessioninfo,  # reporting / reproducibility 
+  tidycensus
+)
+
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  cache     = FALSE,
+  out.width = "75%",
+  fig.path  = here("Output", "Figures", "Fig-"),
+  fig.align = "center",
+  dpi       = 800
+)
+```
+
+
+
+### ACS 1 Year Estimates for Per Capita Income by Racial Group
+
+```{r}
+
+# Specifying all available years for ACS 1 year estimates accross all states
+years <- 2005:2019
+names(years) <- years
+# Define the variables being downloaded
+variables <- c(
+      "B19301A_001",  # Per capita income for White alone
+      "B19301B_001",  # Per capita income for Black or African American alone
+      "B19301C_001",  # Per capita income for American Indian and Alaska Native alone
+      "B19301D_001",  # Per capita income for Asian alone
+      "B19301I_001"   # Per capita income for Hispanic or Latino
+  )
+
+# Retrieve data for specific racial groups and income variables through time 
+acs_racial_income <- map_dfr(years, ~{
+  get_acs(
+    geography = "state",
+    variables = variables,
+  year = .x,
+  survey = "acs1",
+  output = "wide",
+  moe_level = 95 #95% confidence
+) %>%
+  rename(
+    GEOID = GEOID,
+    State = NAME,
+    White_Per_Capita_Income = B19301A_001E,
+    White_Per_Capita_Income_MOE = B19301A_001M,
+    Black_Per_Capita_Income = B19301B_001E,
+    Black_Per_Capita_Income_MOE = B19301B_001M,
+    Native_American_Per_Capita_Income = B19301C_001E,
+    Native_American_Per_Capita_Income_MOE = B19301C_001M,
+    Asian_Per_Capita_Income = B19301D_001E,
+    Asian_Per_Capita_Income_MOE = B19301D_001M,
+    Hispanic_Per_Capita_Income = B19301I_001E,
+    Hispanic_Per_Capita_Income_MOE = B19301I_001M
+  )
+}, .id = "Year") %>% suppressMessages()
+
+# Reshape the data to long format including MOE
+acs_racial_income_long <- acs_racial_income %>%
+  group_by(GEOID, State, Year) %>%
+  pivot_longer(
+    cols = c(White_Per_Capita_Income, White_Per_Capita_Income_MOE,
+             Black_Per_Capita_Income, Black_Per_Capita_Income_MOE,
+             Native_American_Per_Capita_Income, Native_American_Per_Capita_Income_MOE,
+             Asian_Per_Capita_Income, Asian_Per_Capita_Income_MOE,
+             Hispanic_Per_Capita_Income, Hispanic_Per_Capita_Income_MOE),
+    names_to = c("Race", "Metric"),
+    names_pattern = "(.*)_Per_Capita_(.*)",
+    values_to = "Value"
+  ) %>%
+  pivot_wider(
+    names_from = Metric,
+    values_from = Value
+  ) 
+
+# Calculate the mean per capita income and mean MOE for each race by state
+race_income_summary <- acs_racial_income_long %>%
+  group_by(GEOID, State, Race) %>%
+  summarise(
+    Mean_Income = mean(Income, na.rm = TRUE),
+    Mean_MOE = mean(Income_MOE, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Display the summary
+print(race_income_summary)
+
+# Download shapefile for U.S. states
+states <- tigris::states(cb = TRUE)
+
+# Merge the spatial data with the income summary data
+race_income_map <- states %>%
+  left_join(race_income_summary, by = c("NAME" = "State")) %>%
+  dplyr::filter(!is.na(Mean_Income)) %>% # Filter out states without data
+  shift_geometry()  # Shift the geometries to the center of the state
+
+# Plot the mean income on the map, colored by income levels
+ggplot(race_income_map) +
+  geom_sf(aes(fill = Mean_Income), color = "white", lwd = 0.2) +
+  scale_fill_viridis_c(option = "plasma", name = "Mean Income") +
+  facet_wrap(~ Race) + # Create a separate map for each race
+  coord_sf(expand = FALSE) +  # Ensure the map aspect ratio is preserved
+    labs(title = "Mean Per Capita Income by Racial/Ethnic Group and State, Average 2005-2019",
+         caption = "Data source: 2005-2020 1-year ACS, US Census Bureau",
+         fill = "Per Capita Income") +
+    theme_void() +
+    theme(legend.position = "bottom",
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.caption = element_text(size = 10, hjust = 0),
+      strip.text = element_text(size = 12)
+    ) + 
+   coord_sf(crs = 'ESRI:102003', datum = 'ESRI:102003')
+
+race_income_ts <- acs_racial_income_long %>%
+  group_by(Year, Race) %>% 
+  dplyr::summarize(Per_Capita_Income = mean(Income, na.rm = TRUE),
+            Per_Capita_Income_MOE = mean(Income_MOE, na.rm = TRUE)) %>%
+  ungroup()
+
+# Create the time series plot for each Racial Group +/- MOE
+ggplot(race_income_ts, aes(x = Year, y = Per_Capita_Income, color =Race, group=Race))+
+  facet_wrap(~Race) +
+  geom_errorbar(aes(ymin = Per_Capita_Income - Per_Capita_Income_MOE, ymax = Per_Capita_Income + Per_Capita_Income_MOE), width = 0.2) +
+  geom_line(size = 1) +
+  geom_point(size = 0.1) +
+  theme_minimal() +
+  labs(
+    title = "Per Capita Income by Racial/Ethnic Group Over Time",
+    x = "Year",
+    y = "Per Capita Income") +
+  theme(element_text(size = 5),
+    axis.text.x = element_text(angle = 45, hjust = 1, size=6),
+    legend.position = "bottom"
+  )
+
+```
+
+# Measures of Inequality 
+
+Wealth inequality is significantly increasing in the United States and many other high-income countries. This trend is crucial to understand as it shapes the distribution of opportunity, disadvantage, and power across individuals and communities.Gini coefficients are a common measure of wealth inequality, providing a single value that encapsulates the degree of inequality within a distribution. The Gini coefficient ranges from 0 (perfect equality) to 1 (maximum inequality), making it a useful tool for comparing wealth distributions across different populations or over time. These values can be used to test for differences in wealth inequality between different countries or regions, and to track changes in inequality over time. The Geographic Wealth Inequality Database ("GEOWEALTH-US") provides the first estimates of the level and distribution of wealth at various geographical scales within the United States from 1960 to 2020. This data enables new lines of investigation into the contribution of spatial wealth disparities to major societal challenges including wealth concentration, income inequality, social mobility, housing unaffordability, and political polarization.
+
+# Calcualting Inequality (Gini Coefficients Example Calculations Between Nations )
+
+*Gini Coefficient* 
+
+The Gini coefficient is a widely recognized statistical measure used to gauge the degree of inequality within a distribution, particularly in the context of wealth or income. Developed by the Italian statistician Corrado Gini in 1912, the Gini coefficient provides a single value that encapsulates the inequality across an entire population, making it a crucial tool in economics and social sciences for understanding disparities in wealth and income distribution. 
+
+Mathematically, the Gini coefficient (\(G\)) is defined as:
+
+\[
+G = \frac{\sum_{i=1}^{n} \sum_{j=1}^{n} |x_i - x_j|}{2n^2 \overline{x}}
+\]
+
+Where:
+- \(n\) is the number of individuals or households in the population.
+- \(x_i\) and \(x_j\) represent the income or wealth of individuals \(i\) and \(j\).
+- \(\overline{x}\) is the mean income or wealth of the population.
+
+In this equation:
+- The numerator \(\sum_{i=1}^{n} \sum_{j=1}^{n} |x_i - x_j|\) calculates the absolute differences between all pairs of individual wealth values.
+- The denominator \(2n^2 \overline{x}\) normalizes these differences by the population size and average wealth or income.
+
+This equation operates by comparing all possible pairs of individuals or households in the population, calculating the absolute difference between their incomes or wealths. The sum of these absolute differences is then normalized by dividing by \(2n^2\) (the square of the population size, scaled by 2) and the mean income or wealth of the population, \(\overline{x}\). The resulting Gini coefficient ranges from 0 (perfect equality, where everyone has the same income or wealth) to 1 (maximum inequality, where one individual possesses all the income or wealth). A Gini coefficient of 0 represents perfect equality, where everyone has the same income or wealth, while a Gini coefficient of 1 (or 100 if expressed as a percentage) indicates maximum inequality, where a single individual or household possesses all the income or wealth, and everyone else has none. Therefore, the closer the Gini coefficient is to 0, the more equal the distribution, and the closer it is to 1, the more unequal the distribution. The Gini coefficient’s ability to distill complex income or wealth distributions into a single, easily interpretable number has made it an indispensable tool for economists, sociologists, and policymakers. It allows for straightforward comparisons of inequality levels within a single country over time, or between different countries or regions. 
+
+
+## Lorenz-Curve Calculations & Gini Coefficients Calculations
+
+For each country-year group, the cumulative income share is calculated as the cumulative sum of decile incomes divided by total income under the simplifying assumption that total income equals ten times the mean income (since each decile represents an equal population share). This produces the values plotted on the Lorenz curve: horizontal axis is population quantiles (deciles), vertical axis is cumulative income share. The line of perfect equality is represented by a straight line with slope 0.1 (so that the bottom 10% holds 10% of income, etc.). Lorenz curves are faceted by country and distinguished by year using line types.
+
+```{r lorenz-curve-calculations, message=FALSE, warning=FALSE, fig.align='center'}
+
+# ── user parameters ─────────────────────────────────────────
+focus_years     <- c(1980, 2015)
+focus_countries <- c("United States", "China",
+                     "India", "Germany",
+                     "Brazil", "Canada")
+# ────────────────────────────────────────────────────────────
+
+gcip <- read_csv(here::here("Data", "GCIP_Data", "GCIPrawdata.csv"),
+                 skip = 2, show_col_types = FALSE) %>% 
+        janitor::clean_names()
+
+lorenz_data <- gcip %>% 
+  filter(country %in% focus_countries,
+         year    %in% focus_years) %>% 
+  pivot_longer(starts_with("decile_"),
+               names_to  = "decile",
+               values_to = "income") %>% 
+  mutate(decile = parse_number(decile)) %>% 
+  group_by(country, year) %>% 
+  arrange(decile, .by_group = TRUE) %>% 
+  mutate(cum_income_share = cumsum(income) /
+                            (10 * first(mean_income))) %>% 
+  ungroup()
+
+country_cols <- setNames(
+  viridis(length(unique(lorenz_data$country)), option = "turbo", end = .92),
+  sort(unique(lorenz_data$country)))
+
+lorenz_plot <- ggplot(lorenz_data,
+                      aes(decile, cum_income_share,
+                          colour   = country,
+                          linetype = factor(year),
+                          group    = interaction(country, year))) +
+  geom_line(linewidth = 0.9) +
+  geom_abline(intercept = 0, slope = 0.1,
+              colour = "grey60", linetype = "dashed") +
+  facet_wrap(~ country, ncol = 3) +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_colour_manual(values = country_cols, guide = "none") +
+  scale_linetype_manual(values = c(`1980` = "solid", `2015` = "dotted"),
+                        guide  = guide_legend(title = "Year",
+                                              override.aes =
+                                                list(colour = "black"))) +
+  labs(title = "Lorenz Curves – Top emitters (1980 vs 2015)",
+       x = "Decile", y = "Cumulative income share") +
+  theme_minimal(base_size = 11) +
+  theme(strip.text      = element_text(face = "bold"),
+        legend.position = "bottom")
+
+print(lorenz_plot)
+
+ggsave(here::here("Output", "Figures",
+                  "GCIP_lorenz_curves_top_emitters.png"),
+       plot   = lorenz_plot,
+       width  = 10, height = 6, dpi = 600)
+
+print(lorenz_plot)
+```
+
+## Gini Coefficients Calculations
+
+The Gini coefficient for each country-year is computed using the definition implemented in the ineq package.  For the full GCIP set, a gini column is vectorized across all rows by applying this function rowwise. Summary statistics (minimum, first quartile, median, mean, third quartile, maximum) are derived from the distribution of all computed Gini coefficients. Selected subsets (e.g., six top emitter economies) are extracted and reported in tabular form. 
+
+```{r gini-calculations, message=FALSE, warning=FALSE, fig.align='center'}
+
+# ── read & clean once ────────────────────────────────────────────────
+gcip <- read_csv(here::here("Data", "GCIP_Data", "GCIPrawdata.csv"),
+                 skip = 2, show_col_types = FALSE) %>% 
+  janitor::clean_names()
+
+# ── focus group settings ─────────────────────────────────────────────
+focus_years     <- c(1980, 2015)
+focus_countries <- c("United States", "China",
+                     "India", "Germany",
+                     "Brazil", "Canada")
+
+# ── add a Gini column to *all* rows (vectorised, no loop) ───────────
+gcip_gini <- gcip %>% 
+  rowwise() %>% 
+  mutate(gini = Gini(c_across(starts_with("decile_")))) %>% 
+  ungroup()
+
+# ── TABLE 1 : six economies, two years ──────────────────────────────
+focus_gini_tbl <- gcip_gini %>% 
+  filter(country %in% focus_countries,
+         year    %in% focus_years) %>% 
+  transmute(`Country – Year` = glue("{country} – {year}"),
+            Gini            = round(gini, 3)) %>% 
+  arrange(`Country – Year`) %>% 
+  kable("html", 
+  caption = "<b style='color:black;'>Gini Coefficients Between Top Emitters (1980 & 2015 Comparison)</b>", 
+        align = "lc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE, position = "center") %>%
+  row_spec(0, bold = TRUE, background = "lightgrey")
+
+
+focus_gini_tbl    # ↩︎ prints nicely inside R Markdown / Quarto
+
+# ── TABLE 2 : global summary statistics ─────────────────────────────
+gini_summary_tbl <- gcip_gini %>% 
+  summarise(min    = min(gini),
+            `1st Q` = quantile(gini, .25),
+            median = median(gini),
+            mean   = mean(gini),
+            `3rd Q` = quantile(gini, .75),
+            max    = max(gini)) %>% 
+  pivot_longer(everything(),
+               names_to  = "Statistic",
+               values_to = "Value") %>% 
+  kable("html", caption = "<b style='color:black;'>Gini Coefficients Between All Countries & Years</b>", 
+        align = "lc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE, position = "center") %>%
+  row_spec(0, bold = TRUE, background = "lightgrey")
+
+gini_summary_tbl  # ↩︎ shows under the first table
+
+# ── TIME-SERIES PLOT : focus group 1980-2020 ────────────────────────
+# dynamic, consistent palette
+pal <- setNames(viridis(length(focus_countries), option = "mako", end = .9),
+                focus_countries)
+
+gini_ts_plot <- gcip_gini %>% 
+  filter(country %in% focus_countries) %>% 
+  ggplot(aes(year, gini, colour = country)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.5) +
+  scale_colour_manual(values = pal, name = NULL) +
+  scale_y_continuous(labels = number_format(accuracy = .01)) +
+  labs(title = "Economic Inequality in Top Emitters (1980 – 2020)",
+       subtitle = "Gini coefficients based on GCIP income-decile data",
+       x = NULL, y = "Gini coefficient") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position  = "bottom",
+        legend.direction = "horizontal")
+
+print(gini_ts_plot)
+
+ggsave(here::here("Output", "Figures",
+                  "GCIP_gini_coefficient_top_emitters.png"),
+       plot   = gini_ts_plot,
+       width  = 9, height = 5, dpi = 600)
+
+```
+
+
+# Wealth Inequality Model - GEOWEALTH-US Dataset
+
+Citation
+Suss J., Kemeny T., & Connor D. S. (2024). “GEOWEALTH-US: Spatial wealth inequality data for the United States, 1960–2020.” Scientific Data, 11(1), 253.
+
+Although the national wealth gap in the United States is well documented, we have had no consistent way to see where those disparities are largest or how they have evolved over time. GEOWEALTH-US fills that gap by: stitching together U.S. Federal Reserve surveys (wealth micro-data) with Census/ACS micro-samples (demographics & geography) via machine-learning-based imputation; delivering the first continuous time-series (1960 -> 2020) of wealth measures at multiple spatial scales. Time points: 1960, 1970, 1980, 1990, 2000, 2010, 2020
+
+```{r glossary-table, echo=FALSE}
+
+# ---- variable glossary -----------------------------------------------
+glossary <- tribble(
+  ~Variable,        ~Description,
+  "year",           "Census / ACS year",
+  "id",             "Spatial identifier (numeric for PUMA / CZ / metarea; 2-letter code for state; string for division)",
+  "obs",            "Number of micro-records (observations) in the area",
+  "households",     "Number of households in the area",
+  "income_mean",    "Mean total household income (USD, CPI-adjusted)",
+  "wealth_mean",    "Mean household net worth (USD, CPI-adjusted)",
+  "wealth_median",  "Median household net worth",
+  "wealth_gini",    "Gini coefficient of household wealth (0 = equal, 1 = max inequality)",
+  "wealth_sd",      "Standard deviation of household wealth",
+  "rent",           "Share of households that rent their home",
+  "own_outright",   "Share that own their home outright",
+  "own_mortgage",   "Share that own with a mortgage"
+)
+
+# ---- render table -----------------------------------------------------
+glossary %>% 
+  kable("html",
+        caption = "<b>GEOWEALTH-US variable dictionary</b>",
+        align   = c("l","l")) %>% 
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width        = FALSE,
+                position          = "center") %>% 
+  row_spec(0, bold = TRUE, background = "lightgrey")
+```
+
+
+## Load Data 
+
+```{r loading-geowealth}
+
+# Load the dataset
+cz_wealth <- read.csv(here("Data", "GEO-WEALTH", "cz_wealth_inequality.csv"))
+state_wealth <- read.csv(here("Data", "GEO-WEALTH", "state_wealth_inequality.csv"))
+puma_wealth <- read.csv(here("Data", "GEO-WEALTH", "puma_wealth_inequality.csv"))
+metarea_wealth <- read.csv(here("Data", "GEO-WEALTH", "metarea_wealth_inequality.csv"))
+division_wealth <- read.csv(here("Data", "GEO-WEALTH", "division_wealth_inequality.csv"))
+
+# View the first few rows to understand the structure
+head(cz_wealth)
+head(state_wealth)
+head(puma_wealth)
+head(metarea_wealth)
+head(division_wealth)
+
+# Prepare summary of mean Gini across states per year (with 95% CI)
+state_gini_summary <- state_wealth %>% 
+    filter(!is.na(wealth_gini)) %>% 
+    group_by(year) %>% 
+    dplyr::summarize(
+        mean_gini = mean(wealth_gini, na.rm = TRUE),
+        sd_gini   = sd(wealth_gini, na.rm = TRUE),
+        n         = sum(!is.na(wealth_gini)),
+        se        = sd_gini / sqrt(n),
+        lower     = mean_gini - 1.96 * se,
+        upper     = mean_gini + 1.96 * se,
+        .groups = "drop"
+    )
+
+# Plot average Gini over time with 95% CI ribbon
+avg_gini_us_plot <- ggplot(state_gini_summary, aes(x = year, y = mean_gini)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "grey80", alpha = 0.5) +
+    geom_line(size = 1.1) +
+    geom_point(size = 2) +
+    labs(
+        title    = "Average State-level Gini Coefficient in the U.S. (1960–2020)",
+        subtitle = "Shaded band is the 95% confidence interval across states",
+        x        = "Year",
+        y        = "Mean Gini Coefficient"
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title     = element_text(size = 14, face = "bold"),
+        plot.subtitle  = element_text(size = 10),
+        axis.title     = element_text(face = "bold"),
+        axis.text      = element_text(size = 9)
+    )
+
+print(avg_gini_us_plot)
+
+# Save with consistent naming
+ggsave(
+    here::here("Output", "Figures", "GEOWEALTH-gini-mean-state-over-time.png"),
+    plot = avg_gini_us_plot,
+    width = 8, height = 5, dpi = 600
+)
+```
+
+## Exploring Gini Coefficients 
+
+```{r geowealth-states, message=FALSE, warning=FALSE}
+
+# Filter the data for the decades 1960, 1970, 1980, 1990, 2000, 2010, and 2020
+state_wealth_filtered <- state_wealth %>%
+  #filter(year %in% c(1960, 1970, 1980, 1990, 2000, 2010, 2020)) %>% 
+  mutate(year = as.factor(year)) %>%
+  mutate(state = tolower(state)) %>%  # Convert state names to title case
+  distinct(state, year, .keep_all = TRUE)  # Remove duplicate rows based on state and year
+
+# Calculate the mean national Gini coefficient for 1960 and 2020
+mean_national_gini_1960 <- mean(state_wealth_filtered$wealth_gini[state_wealth_filtered$year == 1960], na.rm = TRUE)
+mean_national_gini_2020 <- mean(state_wealth_filtered$wealth_gini[state_wealth_filtered$year == 2020], na.rm = TRUE)
+
+# Create the plot for Gini coefficients across states for each decade
+gini_plot <- ggplot(state_wealth_filtered, aes(x = state, y = wealth_gini, color = year, group = interaction(state, year))) +
+  geom_errorbar(aes(ymin = wealth_gini - gini_sd, ymax = wealth_gini + gini_sd), width = 0.3) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = mean_national_gini_1960, linetype = "dashed", color = "orangered", size = 0.5) +
+  geom_hline(yintercept = mean_national_gini_2020, linetype = "dashed", color = "purple1", size = 0.5) +
+  labs(title = "Gini Coefficients per State (1960-2020)",
+       x = "State",
+       y = "Gini Coefficient",
+       color = "Year") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 1, size = 5),
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title.x = element_text(size = 7.5, face = "bold", margin = margin(t = 10)),
+    axis.title.y = element_text(size = 7.5, face = "bold"),
+    legend.title = element_text(size = 7.5, face = "bold"),
+    legend.text = element_text(size = 7.5)
+  )
+
+print(gini_plot)
+
+gini_trend <- ggplot(state_wealth_filtered, aes(x = year, y = wealth_gini, group = state, color = state)) +
+  geom_line() +
+  labs(title = "Trend of Gini Coefficient by State Over Decades",
+       x = "Decade",
+       y = "Gini Coefficient") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 1, size = 5),
+    plot.title = element_text(size = 10, face = "bold"),
+    axis.title.x = element_text(size = 7.5, face = "bold", margin = margin(t = 10)),
+    axis.title.y = element_text(size = 7.5, face = "bold"),
+    legend.title = element_text(size = 7.5, face = "bold"),
+    legend.text = element_text(size = 6)
+  )
+
+print(gini_trend)
+
+ggsave(here("Output", "Figures", "GEOWEALTH-gini_coefficients_per_state.png"),
+       plot = gini_plot,
+       width = 10, height = 6, dpi = 600)
+ggsave(here("Output", "Figures", "GEOWEALTH-gini_trend_by_state.png"),
+       plot = gini_trend,
+       width = 10, height = 6, dpi = 600)
+
+
+
+```
+
+
+
+## Mapping Gini Coefficients Across States
+
+```{r geowealth-mapping, message=FALSE}
+
+# Load US states shapefile using tigris
+us_states <- tigris::states(cb = TRUE, resolution = "20m", year="2020")
+us_counties <- tigris::counties(cb = TRUE, resolution = "20m", year="2020")
+# Check the first few rows of the shapefile
+#head(us_states)
+
+# Ensure the coordinate reference system (CRS) is consistent
+us_states <- st_transform(us_states, crs = st_crs(4326)) %>% # Transform to WGS 84
+  st_crop(us_states, xmin = -125, xmax = -66.5, ymin = 24, ymax = 50) %>% 
+  mutate(state=tolower(NAME))
+
+# Check the first few rows of the transformed shapefile
+state_wealth_mapping <- state_wealth %>% 
+  left_join(us_states, by = c("state" = "state"))  # Join the state wealth data with the state shapefile
+
+# Check the first few rows of the merged dataset
+#head(state_wealth_mapping)
+
+# Refined plotting code
+gini_plot <- ggplot(state_wealth_mapping) +
+  geom_sf(aes(fill = wealth_gini, geometry = geometry)) +
+  scale_fill_viridis_c(option = "plasma", direction = -1) +
+  labs(title = "Gini Coefficients per State (1960-2020)",
+       fill = "Gini Coefficient") +
+  coord_sf(crs = st_crs(4326), expand = FALSE) +  # Ensure proper CRS and remove graticules
+  facet_wrap(~ year, ncol = 2) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),  # Remove axis text
+    axis.ticks = element_blank(),  # Remove axis ticks
+    panel.grid = element_blank(),  # Remove grid lines
+    strip.text = element_text(size = 10),  # Adjust facet label size
+    plot.title = element_text(size = 14)  # Adjust title size
+  )
+
+# Plot Mean Wealth
+wealth_plot <- ggplot(state_wealth_mapping) +
+  geom_sf(aes(fill = wealth_mean, geometry = geometry)) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(title = "Mean Wealth per State",
+       fill = "Mean Wealth") +
+  coord_sf(crs = st_crs(4326), expand = FALSE) +  # Ensure proper CRS and remove graticules
+  facet_wrap(~ year, ncol = 2) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),  # Remove axis text
+    axis.ticks = element_blank(),  # Remove axis ticks
+    panel.grid = element_blank(),  # Remove grid lines
+    strip.text = element_text(size = 10),  # Adjust facet label size
+    plot.title = element_text(size = 14)  # Adjust title size
+  )
+
+# Plot Mean Income
+income_plot <- ggplot(state_wealth_mapping) +
+  geom_sf(aes(fill = income_mean, geometry = geometry)) +
+  scale_fill_viridis_c(option = "inferno") +
+  labs(title = "Mean Income per State",
+       fill = "Mean Income")+
+  coord_sf(crs = st_crs(4326), expand = FALSE) +  # Ensure proper CRS and remove graticules
+  facet_wrap(~ year, ncol = 2) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),  # Remove axis text
+    axis.ticks = element_blank(),  # Remove axis ticks
+    panel.grid = element_blank(),  # Remove grid lines
+    strip.text = element_text(size = 10),  # Adjust facet label size
+    plot.title = element_text(size = 14)  # Adjust title size
+  )
+# Display the plots
+print(gini_plot)
+print(wealth_plot)
+print(income_plot)
+
+# Save with your naming convention
+ggsave(here::here("Output", "Figures", "GEOWEALTH-gini-by-state.png"),
+       plot = gini_plot, width = 10, height = 6, dpi = 600)
+ggsave(here::here("Output", "Figures", "GEOWEALTH-mean-wealth-by-state.png"),
+       plot = wealth_plot, width = 10, height = 6, dpi = 600)
+ggsave(here::here("Output", "Figures", "GEOWEALTH-mean-income-by-state.png"),
+       plot = income_plot, width = 10, height = 6, dpi = 600)
+```
+
+
+
+# Citations
+
+Suss, J., Kemeny, T., & Connor, D. S. (2024). GEOWEALTH-US: Spatial wealth inequality data for the United States, 1960–2020. Scientific Data, 11(1), 253.
+. 
+Global Consumption and Income Project (GCIP) income decile data, as used in CORE Econ Doing Economics materials. CORE Econ. (2023/2024). Measuring inequality: Lorenz curves and Gini coefficients. Data retrieved from the GCIP dataset.
+

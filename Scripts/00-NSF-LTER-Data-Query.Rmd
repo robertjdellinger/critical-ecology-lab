@@ -1,0 +1,690 @@
+---
+title: "**Data Wrangling and Query: NSF Long Term Ecological Research (LTER) Data**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+header-includes:
+  - |
+    <style>
+      pre, code { font-size: 0.9em; line-height: 1.3; }
+    </style>
+---
+
+# Data Wrangling and Query: NSF Long Term Ecological Research (LTER) Data
+
+## Data source & methods
+
+**Source.** The Environmental Data Initiative (EDI) provides access to a wide range of datasets from the NSF Long Term Ecological Research (LTER) program. We will focus on datasets related to atmospheric deposition, impervious surface area, population density, and precipitation. 
+
+**Methods.** We will use the EDIutils package to search for and download relevant datasets, then process them for analysis. The datasets will be cleaned, filtered, and prepared for visualization.
+
+# Setup Packages
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::knit_engines$set()
+
+# Load Libraries in R Script
+if (!require("pacman")) install.packages("pacman")
+
+# Data manipulation and general utilities
+pacman::p_load(
+  broom, devtools,dplyr, fs, glue, here, htmltools, janitor, knitr, 
+  latex2exp, lubridate, markdown, metajam, magick, png, purrr, RColorBrewer, readr, remotes, 
+  rmarkdown, stringr, tibble, tidyr, tidyverse, units, usethis,
+  RColorBrewer,leaflet, leaflet.extras, leaflet.providers, leaflet.minicharts
+)
+
+# Plotting and visualization
+pacman::p_load(
+  # plotting packages 
+  cowplot, ggforce, ggfx, ggimage, gginnards, ggplot2, 
+  ggpmisc, ggpp, ggpubr, ggrepel, ggsci, ggstatsplot, ggsignif, ggthemes, ggtext,
+  grid, gridExtra,
+  # table packages
+  gt, gtExtras, gtsummary,
+  # gis and mapping packages
+  sf, raster, ggmap
+)
+
+output_path_images <- here::here("Output", "Figures")
+
+# Social Analysis Packages 
+pacman::p_load(
+tigris, # census data from the U.S. Census API
+EDIutils # Environmental Data access and down load package (LTER Sites)
+)
+
+```
+
+# LTER Data (Searchable Dataset Table & Associated DOIs)
+Searching and Accessing HBES LTER Data from the Environmental Data Initiative repository
+
+
+## Search datasets
+
+```{r searching-datasets} 
+
+# Find all HBR LTER data packages, displaying the package id, title, and DOI
+query <- 'q=keyword:hubbard&fl=packageid,title,doi,author,organization,pubdate,abstract'
+
+res <- search_data_packages(query)
+
+# Create the gt table with improved formatting
+hbes_lter_gt <- gt(res) %>%
+  tab_header(title = "HBES LTER Datasets") %>% fmt_auto(everything()) %>%
+  fmt_url(columns = doi,label = "DOI", color="darkolivegreen3", show_underline = FALSE) %>%
+  cols_merge(c(title, doi), pattern = "{1}<br>({2})") %>% 
+  cols_merge(columns = c(authors, organizations, pubdate), pattern = html("{1}<br><i>{2}</i><br>({3})")
+  ) %>% cols_label("authors"="Authors (Date)", "title"="Dataset Title & DOI")  %>%
+  cols_label_with(fn = function(x) {x %>% toupper() %>% str_replace_all("^|$", "**") %>%
+      sprintf("<span style='font-size:12px;'>%s</span>", .) %>%
+      html() %>%  md()}) %>%
+  cols_align(columns = doi, align = "center") %>% cols_align(align = "auto")  %>% 
+  cols_width(columns = c(packageid) ~ px(125)) %>%
+  cols_width(columns = c(abstract) ~ px(300)) %>%
+  cols_width(columns = c(title) ~ px(185)) %>%
+  cols_width(columns = c(authors) ~ px(185)) %>%
+  tab_style(style = cell_text(size = px(12)),locations = cells_body()) %>% 
+  tab_style(style = cell_text(size = px(11)), locations = cells_body(columns = c(abstract))) %>%
+  tab_source_note(source_note = md("Datasets from the Environmental Data Initiative")) %>% 
+  opt_table_font(font = "rounded-sans")  %>% 
+  tab_options(ihtml.active =TRUE, ihtml.use_highlight=TRUE, ihtml.use_filters=TRUE, ihtml.use_sorting=TRUE,
+              page.header.use_tbl_headings=TRUE, ihtml.use_search=TRUE, ihtml.use_compact_mode=TRUE)
+
+# Display the table
+hbes_lter_gt
+
+```
+
+## Downloading EDI Data from a Selected Dataset (Example)
+
+Example on how to download data from the EDI Utils package to analyze and plot data from HBES LTER. Data is from a previously published study on health and mycorrhizal colonization response of sugar maple (Acer saccharum) seedlings to calcium addition in Watershed 1 at the Hubbard Brook Experimental Forest. 
+
+```{r hubbard-brook-lter-example, message=FALSE, warning=FALSE}
+
+# Clear Directory Contents 
+if (!dir_exists(tempdir())) {
+  dir_create(tempdir())
+} else {
+  dir_ls(tempdir()) %>% file_delete()
+}
+
+# Downloading Zipped Files
+packageid <- "knb-lter-hbr.157.3"
+read_data_package_archive(packageid, path = tempdir())
+
+# Viewing Entities
+entities <- read_data_entity_names(packageid)
+entities_gt <- gt(entities) %>% fmt_auto() %>%
+    cols_label_with(fn = function(x) {x %>% toupper() %>% str_replace_all("^|$", "**") %>%
+      sprintf("<span style='font-size:15px;'>%s</span>", .) %>%
+      html() %>%  md()}) %>% opt_table_font(font = "rounded-sans") %>% 
+  tab_style(style = cell_text(size = px(15)),locations = cells_body())  %>% 
+  tab_options(ihtml.active =TRUE, ihtml.use_highlight=TRUE, ihtml.use_filters=TRUE, ihtml.use_sorting=TRUE,
+              page.header.use_tbl_headings=TRUE, ihtml.use_search=TRUE, ihtml.use_compact_mode=TRUE)
+entities_gt
+
+```
+
+## Selecting CSV File for Download 
+
+```{r downloading-data}
+
+# Download filename.csv in raw bytes. Use the entityName and entityID as keys.
+entityName <- "w1_acsa_seed_physical"
+
+#visualize the data and save as dataframe
+entityid <- entities$entityId[entities$entityName == entityName]
+raw <- read_data_entity(packageid, entityid)
+data <- readr::read_csv(file = raw)
+data_gt <- gt(data) %>% fmt_auto %>%
+  tab_header(title = "Downloaded Dataset") %>% 
+    cols_label_with(fn = function(x) {x %>% toupper() %>% str_replace_all("^|$", "**") %>%
+      sprintf("<span style='font-size:10px;'>%s</span>", .) %>%
+      html() %>%  md()}) %>% opt_table_font(font = "rounded-sans") %>% 
+  tab_style(style = cell_text(size = px(10)),locations = cells_body())  %>% 
+  tab_options(ihtml.active =TRUE, ihtml.use_highlight=TRUE, ihtml.use_sorting=TRUE,
+              page.header.use_tbl_headings=TRUE, ihtml.use_search=TRUE, ihtml.use_compact_mode=TRUE)
+data_gt
+
+hbr_maples_raw <- data
+```
+
+## Cleaning Downloaded Dataset, Visualization, & Analysis
+
+```{r, message=FALSE, warning=FALSE}
+
+# Clean/Wrangle Data and Prepare for Summary Statistics Analysis
+hbr_maples <- hbr_maples_raw %>%
+  clean_names() %>%
+  dplyr::select(-root_area,-root_length,-root_dry_mass) %>%
+  # change values of -999 to NA
+  mutate(
+    leaf1area = replace(leaf1area, which(leaf1area < 0), NA),
+    leaf2area = replace(leaf2area, which(leaf2area < 0), NA),
+    corrected_leaf_area = replace(corrected_leaf_area, which(corrected_leaf_area < 0), NA),
+    watershed = as.factor(watershed),
+    elevation = as.factor(elevation),
+    transect = as.factor(transect),
+    sample = as.factor(sample)
+  )
+
+# Summary statistics for the data set
+ maple_summary <- hbr_maples %>% 
+  drop_na(stem_length) %>% 
+  group_by(year, watershed) %>% 
+  dplyr::summarize(
+    mean_length = mean(stem_length, na.rm=TRUE),
+    median_length = median(stem_length, na.rm=TRUE),
+    sd_length = sd(stem_length, na.rm=TRUE),
+    n = n()
+  )
+ 
+ maple_summary_gt <- gt(maple_summary) %>% fmt_auto %>%
+  tab_header(title = "Maple Summary Statistics") %>% 
+    cols_label_with(fn = function(x) {x %>% janitor::make_clean_names(., case = "title") %>% 
+        toupper() %>% str_replace_all("^|$", "**") %>%
+      sprintf("<span style='font-size:16px;'>%s</span>", .) %>%
+      html() %>%  md()}) %>% opt_table_font(font = "rounded-sans") %>% 
+  tab_style(style = cell_text(size = px(14)),locations = cells_body()) 
+ 
+ maple_summary_gt
+ 
+# Extract colors from the "BrBG" palette (brown green palette)
+palette_colors <- RColorBrewer::brewer.pal(n = 11, name = "BrBG")
+
+# Assign Colors for Plotting
+plot_colors <- palette_colors[c(2, 9)] 
+
+ ggplot(data = hbr_maples, aes(x = watershed, y = stem_length)) +
+  geom_jitter(
+    aes(color = watershed), alpha = 0.85, show.legend = TRUE, size=0.75,
+    position = position_jitter(width = 0.2, seed = 0)) +
+    geom_boxplot(aes(color = watershed), fill = NA,
+                 alpha=0.75, width = 0.5, linewidth=0.5) +
+    scale_color_manual(values = plot_colors) +
+  labs(x = "Watershed", y = "Stem Length (mm)",
+    title = "Stem Lengths of Sugar Maple Seedlings", subtitle = "Hubbard Brook LTER") +
+  facet_wrap(~year) +
+  theme_minimal(base_family = "sans") + 
+   theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"),
+         axis.title = element_text(face = "bold"), legend.position = "bottom", 
+         panel.grid.major.x=element_blank())
+
+
+
+ggplot(data = hbr_maples, aes(x = stem_length)) +
+  geom_histogram(bins=30, aes(fill=factor(year)), color="white", lineiwdth=0.05) +
+  scale_fill_manual(values = plot_colors) +
+  theme_minimal(base_family = "sans") +   
+  theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"),     
+        axis.title = element_text(face = "bold"), legend.position = "bottom") +
+  labs(
+    x = "Stem Length (mm)",
+    y = "Frequency",
+    title = "Distribution of Sugar Maple Seedling Stem Lengths",
+    subtitle = "Hubbard Brook LTER"
+  ) +
+  facet_grid(year ~ watershed)
+
+length_colors <- palette_colors[c(7:11)] 
+
+ggplot(hbr_maples) +
+  geom_point(aes(color = stem_length, x = stem_length, y = stem_dry_mass), alpha = 0.6) +
+  scale_color_gradientn(colors = length_colors) +
+  labs(
+    x = "Stem Length (mm)",
+    y = "Stem Dry Mass (g)",
+    title = "Stem Dry Mass vs. Stem Length in Sugar Maple Seedlings",
+    subtitle = "Hubbard Brook LTER"
+  ) +
+  theme_minimal(base_family = "sans")  + 
+   theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"),
+         axis.title = element_text(face = "bold"), legend.position = "none", 
+         panel.grid.major.x=element_blank())
+
+ggplot(hbr_maples) +
+  geom_point(aes(x = stem_length, y = stem_dry_mass, color = factor(year))) +
+  scale_color_manual(values = plot_colors) +
+  labs(
+    x = "Stem Length (mm)",
+    y = "Stem Dry Mass (g)",
+    title = "Stem Dry Mass vs. Stem Length in Sugar Maple Seedlings",
+    subtitle = "Hubbard Brook LTER",
+    color = "year"
+  ) +
+  facet_wrap(~watershed) +
+  theme_minimal(base_family = "sans") +
+    theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"),     
+        axis.title = element_text(face = "bold"), legend.position = "bottom")
+
+f_test_maple <- hbr_maples %>% 
+  filter(year == 2004) %>% 
+  var.test(stem_length ~ watershed, data = .)
+  
+# Statistical tests 
+hbr_maples %>% 
+  filter(year == 2004) %>% 
+  var.test(stem_length ~ watershed, data = .) %>% tidy() %>% gt() %>% fmt_auto %>%
+  tab_header(title = "Maple Leaf Variance Test Results") %>% 
+    cols_label_with(fn = function(x) {x %>% janitor::make_clean_names(., case = "title") %>% 
+        toupper() %>% str_replace_all("^|$", "**") %>%
+      sprintf("<span style='font-size:12px;'>%s</span>", .) %>%
+      html() %>%  md()}) %>% opt_table_font(font = "rounded-sans") %>% 
+  tab_style(style = cell_text(size = px(12)),locations = cells_body())
+
+t_test_maple <- hbr_maples %>% 
+  filter(year == 2004) %>% 
+  t.test(stem_length ~ watershed,
+         var.equal = TRUE,
+         data = .)
+
+hbr_maples %>% 
+  filter(year == 2004) %>% 
+  t.test(stem_length ~ watershed,
+         var.equal = TRUE,
+         data = .) %>% tidy() %>% gt() %>% fmt_auto %>%
+  tab_header(title = "Maple Leaf T-Test Results") %>% 
+    cols_label_with(fn = function(x) {x %>% janitor::make_clean_names(., case = "title") %>% 
+        toupper() %>% str_replace_all("^|$", "**") %>%
+      sprintf("<span style='font-size:12px;'>%s</span>", .) %>%
+      html() %>%  md()}) %>% opt_table_font(font = "rounded-sans") %>% 
+  tab_style(style = cell_text(size = px(12)),locations = cells_body()) 
+
+
+
+```
+
+
+# International Long-Term Ecological Research Network (ILTER) Atmospheric Deposition and Stream Nitrogen Synthesis
+
+## Downloading ZIP File & Viewing Entities
+ 
+```{r lter-data, message=FALSE, warning=FALSE}
+# Clear Directory Contents 
+if (!dir_exists(tempdir())) {
+  dir_create(tempdir())
+} else {
+  dir_ls(tempdir()) %>% file_delete()
+}
+
+# Downloading Zipped Files
+packageid <- "edi.1066.1"
+read_data_package_archive(packageid, path = tempdir())
+
+# Viewing Entities
+entities <- read_data_entity_names(packageid)
+entities_gt <- gt(entities) %>% fmt_auto() %>%
+    cols_label_with(fn = function(x) {x %>% toupper() %>% str_replace_all("^|$", "**") %>%
+      sprintf("<span style='font-size:15px;'>%s</span>", .) %>%
+      html() %>%  md()}) %>% opt_table_font(font = "rounded-sans") %>% 
+  tab_style(style = cell_text(size = px(15)),locations = cells_body())  %>% 
+  tab_options(ihtml.active =TRUE, ihtml.use_highlight=TRUE, ihtml.use_filters=TRUE, ihtml.use_sorting=TRUE,
+              page.header.use_tbl_headings=TRUE, ihtml.use_search=TRUE, ihtml.use_compact_mode=TRUE)
+#entities_gt
+
+# Download filename.csv in raw bytes. Use the entityName and entityID as keys.
+entityName <- "ILTER_Stream_Deposition_Nitrogen"
+
+#visualize the data and save as dataframe
+entityid <- entities$entityId[entities$entityName == entityName]
+raw <- read_data_entity(packageid, entityid)
+data <- readr::read_csv(file = raw)
+data_gt <- gt(data) %>% fmt_auto %>%
+  tab_header(title = "Downloaded Dataset") %>% 
+    cols_label_with(fn = function(x) {x %>% toupper() %>% str_replace_all("^|$", "**") %>%
+      sprintf("<span style='font-size:10px;'>%s</span>", .) %>%
+      html() %>%  md()}) %>% opt_table_font(font = "rounded-sans") %>% 
+  tab_style(style = cell_text(size = px(10)),locations = cells_body())  %>% 
+  tab_options(ihtml.active =TRUE, ihtml.use_highlight=TRUE, ihtml.use_sorting=TRUE,
+              page.header.use_tbl_headings=TRUE, ihtml.use_search=TRUE, ihtml.use_compact_mode=TRUE)
+data_gt
+
+LTER_acid_deposition_raw <- data
+
+```
+```{r lter-leaflet}
+
+LTER_acid_deposition <- LTER_acid_deposition_raw %>% 
+  # change values of -999 to NA
+  mutate(
+    Stream_Nitrate_Concentration = replace(Stream_Nitrate_Concentration, which(Stream_Nitrate_Concentration < 0), NA),
+    Stream_Ammon_Concentration = replace(Stream_Ammon_Concentration, which(Stream_Ammon_Concentration < 0), NA),
+    Stream_DIN_Concentration = replace(Stream_DIN_Concentration, which(Stream_DIN_Concentration < 0), NA),
+    Stream_Ammon_Flux = replace(Stream_Ammon_Flux, which(Stream_Ammon_Flux < 0), NA),
+    Stream_Nitrate_Flux = replace(Stream_Nitrate_Flux, which(Stream_Nitrate_Flux < 0), NA),
+    Ammon_Wet_Dep = replace(Ammon_Wet_Dep, which(Ammon_Wet_Dep < 0), NA),
+    Tot_Precip_mm = replace(Tot_Precip_mm, which(Tot_Precip_mm < 0), NA),
+    T_Annual_C = replace(T_Annual_C, which(T_Annual_C < 0), NA),
+    Ammon_Bulk_Dep = replace(Ammon_Bulk_Dep, which(Ammon_Bulk_Dep < 0), NA),
+    Nitrate_Bulk_Dep = replace(Nitrate_Bulk_Dep, which(Nitrate_Bulk_Dep < 0), NA),
+    Continent = as.factor(Continent),
+    Site = as.factor(Site)
+  ) 
+
+# Clean and prepare the data
+LTER_acid_deposition_clean <- LTER_acid_deposition %>%
+  filter(!is.na(Year) & !is.na(Site))
+
+# Function to calculate standard error
+calc_se <- function(x) {
+  return(sd(x, na.rm = TRUE) / sqrt(length(na.omit(x))))
+}
+
+# Calculate summary statistics including SE
+summary_stats <- LTER_acid_deposition_clean %>%
+  group_by(Site, Lat, Long) %>%
+  dplyr::summarize(
+    Total_Years = n_distinct(Year),
+    Year_Range = paste0(min(Year), "-", max(Year)),
+    Avg_Tot_Precip_mm = mean(Tot_Precip_mm, na.rm = TRUE),
+    SE_Tot_Precip_mm = calc_se(Tot_Precip_mm),
+    Avg_T_Annual_C = mean(T_Annual_C, na.rm = TRUE),
+    SE_T_Annual_C = calc_se(T_Annual_C),
+    Avg_Stream_Ammon_Concentration = mean(Stream_Ammon_Concentration, na.rm = TRUE),
+    SE_Stream_Ammon_Concentration = calc_se(Stream_Ammon_Concentration),
+    Avg_Stream_Nitrate_Concentration = mean(Stream_Nitrate_Concentration, na.rm = TRUE),
+    SE_Stream_Nitrate_Concentration = calc_se(Stream_Nitrate_Concentration),
+    Avg_Stream_DIN_Concentration = mean(Stream_DIN_Concentration, na.rm = TRUE),
+    SE_Stream_DIN_Concentration = calc_se(Stream_DIN_Concentration),
+    Avg_Ammon_Bulk_Dep = mean(Ammon_Bulk_Dep, na.rm = TRUE),
+    SE_Ammon_Bulk_Dep = calc_se(Ammon_Bulk_Dep),
+    Avg_Nitrate_Bulk_Dep = mean(Nitrate_Bulk_Dep, na.rm = TRUE),
+    SE_Nitrate_Bulk_Dep = calc_se(Nitrate_Bulk_Dep)
+  ) %>%  ungroup() %>% group_by(Site)
+
+# Define a color palette for the sites
+site_colors <- colorFactor(colorRampPalette(brewer.pal(9, "Set1"))(length(unique(summary_stats$Site))), summary_stats$Site)
+
+# Create the interactive map
+leaflet(data = summary_stats) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    ~Long, ~Lat,
+    radius = 5,
+    color = ~site_colors(Site),
+    stroke = FALSE,
+    fillOpacity = 0.7,
+    popup = ~paste(
+      "<strong>Site:</strong>", Site, "<br/>",
+      "<strong>Years Collected:</strong>", Year_Range, "<br/>",
+      "<strong>Avg Total Precipitation (mm):</strong>", round(Avg_Tot_Precip_mm, 2), " ± ", round(SE_Tot_Precip_mm, 2), "<br/>",
+      "<strong>Avg Annual Temperature (°C):</strong>", round(Avg_T_Annual_C, 2), " ± ", round(SE_T_Annual_C, 2), "<br/>",
+      "<strong>Avg Stream Ammonium Concentration (mg/L):</strong>", round(Avg_Stream_Ammon_Concentration, 2), " ± ", round(SE_Stream_Ammon_Concentration, 2), "<br/>",
+      "<strong>Avg Stream Nitrate Concentration (mg/L):</strong>", round(Avg_Stream_Nitrate_Concentration, 2), " ± ", round(SE_Stream_Nitrate_Concentration, 2), "<br/>",
+      "<strong>Avg Stream DIN Concentration (mg/L):</strong>", round(Avg_Stream_DIN_Concentration, 2), " ± ", round(SE_Stream_DIN_Concentration, 2), "<br/>",
+      "<strong>Avg Ammonium Bulk Deposition (mg/m²):</strong>", round(Avg_Ammon_Bulk_Dep, 2), " ± ", round(SE_Ammon_Bulk_Dep, 2), "<br/>",
+      "<strong>Avg Nitrate Bulk Deposition (mg/m²):</strong>", round(Avg_Nitrate_Bulk_Dep, 2), " ± ", round(SE_Nitrate_Bulk_Dep, 2)
+    )
+  ) %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  addScaleBar(position = "bottomleft") %>%
+  addLayersControl(
+    baseGroups = c("Esri World Imagery"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  addLegend("bottomright", pal = site_colors, values = ~Site, title = "Site")
+
+
+# Display summary statistics using gt
+summary_stats_gt <- gt(summary_stats) %>%
+  tab_header(
+    title = "Summary Statistics for LTER Acid Deposition Dataset"
+  ) %>% fmt_auto() %>% 
+  cols_merge(columns = c(Lat, Long), pattern = "{1}, {2}") %>% 
+  cols_label(Lat = "Coordinates", Long = "Coordinates") %>%
+    cols_label_with(fn = function(x) {x %>% janitor::make_clean_names(., case = "title") %>% 
+      toupper() %>% str_replace_all("^|$", "**") %>%
+      sprintf("<span style='font-size:11px;'>%s</span>", .) %>%
+      html() %>%  md()}) %>% opt_table_font(font = "rounded-sans") %>% 
+  tab_style(style = cell_text(size = px(10)),locations = cells_body()) %>% 
+    cols_merge(columns = c(contains("Avg_Tot_Precip"), contains("SE_Tot_Precip")),
+    pattern = "{1} &pm; {2}") %>%
+    cols_merge(columns = c(contains("Avg_T_Annual"), contains("SE_T_Annual")),
+    pattern = "{1} &pm; {2}") %>%
+    cols_merge(columns = c(contains("Avg_Stream_Ammon"), contains("SE_Stream_Ammon")),
+    pattern = "{1} &pm; {2}") %>%
+    cols_merge(columns = c(contains("Avg_Stream_Nitrate"), contains("SE_Stream_Nitrate")),
+    pattern = "{1} &pm; {2}") %>%
+    cols_merge(columns = c(contains("Avg_Stream_DIN"), contains("SE_Stream_DIN")),
+    pattern = "{1} &pm; {2}") %>%
+    cols_merge(columns = c(contains("Avg_Ammon_Bulk"), contains("SE_Ammon_Bulk")),
+    pattern = "{1} &pm; {2}") %>%
+    cols_merge(columns = c(contains("Avg_Nitrate_Bulk"), contains("SE_Nitrate_Bulk")),
+    pattern = "{1} &pm; {2}") %>% 
+  tab_style(style = cell_text(size = px(10), whitespace = "break-spaces"),locations = cells_column_labels()) 
+summary_stats_gt
+
+
+```
+
+## Time Series and Boxplot Visualization of Data Across Sites
+
+```{r lter-timeseries, fig.height=6, fig.width=10}
+
+# Decadal Changes in Acid Deposition and Stream Nitrate Concentration
+LTER_acid_deposition_decades <- LTER_acid_deposition_clean %>%
+  mutate(Decade = (Year %/% 10) * 10)
+
+# Clean and prepare the data
+LTER_acid_deposition_decades <- LTER_acid_deposition_decades %>%
+  filter(!is.na(Stream_Nitrate_Concentration) & !is.na(Stream_Ammon_Concentration) & !is.na(Stream_DIN_Concentration))
+
+# Time Series Plot for Stream Nitrate Concentration over Years
+nitrate_ts <-
+ggplot(LTER_acid_deposition_decades, aes(x = Year, y = Stream_Nitrate_Concentration, color = Site)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Stream Nitrate Concentration Over Years",
+    subtitle = "Faceted by Site",
+    x = "Year",
+    y = "Stream Nitrate Concentration (mg/L)",
+    color = "Site"
+  ) +
+  facet_wrap(~ Site, scales="free") +
+  theme_minimal(base_family = "sans") +
+    theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"),     
+        axis.title = element_text(face = "bold"), legend.position = "none",
+        legend.direction = "horizontal", legend.box = "vertical",
+    plot.margin = margin(1, 1, 1, 1, "cm")
+    )
+
+# Plotting the boxplot for Nitrate Concentration by Decade and Site
+nitrate_boxplot <-
+ggplot(LTER_acid_deposition_decades, aes(x = as.factor(Decade), y = Stream_Nitrate_Concentration, fill = Site)) +
+  geom_boxplot() +
+  labs(
+    title = "Distribution of Stream Nitrate Concentration by Site",
+    subtitle = "Faceted by Site",
+    x = "Decade",
+    y = "Stream Nitrate Concentration (mg/L)"
+  ) +
+  facet_wrap(~Site, scales = "free") +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "italic"),
+    axis.title = element_text(face = "bold"),
+    plot.margin = margin(1, 1, 1, 1, "cm")
+  )
+
+# Time Series Plot for Stream Ammonium Concentration over Years
+ammonium_ts <-
+ggplot(LTER_acid_deposition_decades, aes(x = Year, y = Stream_Ammon_Concentration, color = Site)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Stream Ammonium Concentration Over Years",
+    subtitle = "Faceted by Site",
+    x = "Year",
+    y = "Stream Ammonium Concentration (mg/L)",
+    color = "Site"
+  ) +
+  facet_wrap(~ Site, scales="free") +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "italic"),
+    axis.title = element_text(face = "bold"),
+    plot.margin = margin(1, 1, 1, 1, "cm")
+  )
+
+# Plotting the boxplot for Ammonium Concentration by Decade and Site
+ammonium_boxplot <-
+ggplot(LTER_acid_deposition_decades, aes(x = as.factor(Decade), y = Stream_Ammon_Concentration, fill = Site)) +
+  geom_boxplot() +
+  labs(
+    title = "Distribution of Stream Ammonium Concentration by Site",
+    subtitle = "Faceted by Site",
+    x = "Decade",
+    y = "Stream Ammonium Concentration (mg/L)"
+  ) +
+  facet_wrap(~Site, scales = "free") +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "italic"),
+    axis.title = element_text(face = "bold"),
+    plot.margin = margin(1, 1, 1, 1, "cm")
+  )
+
+# Time Series Plot for Stream DIC Concentration over Years
+dic_ts <-
+ggplot(LTER_acid_deposition_decades, aes(x = Year, y = Stream_DIN_Concentration, color = Site)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Stream DIC Concentration Over Years",
+    subtitle = "Faceted by Site",
+    x = "Year",
+    y = "Stream DIC Concentration (mg/L)",
+    color = "Site"
+  ) +
+  facet_wrap(~ Site, scales="free") +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "italic"),
+    axis.title = element_text(face = "bold"),
+    plot.margin = margin(1, 1, 1, 1, "cm")
+  )
+
+# Plotting the boxplot for DIC Concentration by Decade and Site
+dic_boxplot <-
+ggplot(LTER_acid_deposition_decades, aes(x = as.factor(Decade), y = Stream_DIN_Concentration, fill = Site)) +
+  geom_boxplot() +
+  labs(
+    title = "Distribution of Stream DIN Concentration by Site",
+    subtitle = "Faceted by Site",
+    x = "Decade",
+    y = "Stream DIC Concentration (mg/L)"
+  ) +
+  facet_wrap(~Site, scales = "free") +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "italic"),
+    axis.title = element_text(face = "bold"),
+    plot.margin = margin(1, 1, 1, 1, "cm")
+  )
+
+plotly::ggplotly(ammonium_ts)
+plotly::ggplotly(ammonium_boxplot)
+plotly::ggplotly(nitrate_ts)
+plotly::ggplotly(nitrate_boxplot)
+plotly::ggplotly(dic_ts)
+plotly::ggplotly(dic_boxplot)
+
+```
+
+
+# Exploring HBES Data from the LTER Network
+
+```{r, HBES}
+
+# Filter out rows with missing values in key columns and specifically for Hubbard Brook
+LTER_acid_deposition_HBES <- LTER_acid_deposition %>%
+  filter(!is.na(Stream_Ammon_Concentration) & !is.na(Stream_Nitrate_Concentration) & 
+         !is.na(Year) & !is.na(Site)) %>%
+  filter(Site == "Hubbard Brook Experimental Forest")
+
+
+# Time Series Plot for Stream Nitrate Concentration over Years
+ggplot(LTER_acid_deposition_HBES, aes(x = Year, y = Stream_Nitrate_Concentration, color = Site)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Example Figure: Stream Nitrate Concentration Over Years",
+    x = "Year",
+    y = "Stream Nitrate Concentration (mg/L)",
+    color = "Site"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "bottom", 
+    legend.direction = "horizontal", 
+    legend.box = "vertical",
+    plot.title = element_text(face = "bold"), 
+    plot.subtitle = element_text(face = "italic"),     
+    axis.title = element_text(face = "bold")
+  )
+
+# Time Series Plot for Stream Nitrate Concentration over Years
+ggplot(LTER_acid_deposition_HBES, aes(x = Year, y = Stream_Ammon_Concentration, color = Site)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Stream Ammon Concentration Over Years",
+    x = "Year",
+    y = "Stream Nitrate Concentration (mg/L)",
+    color = "Site"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "bottom", 
+    legend.direction = "horizontal", 
+    legend.box = "vertical",
+    plot.title = element_text(face = "bold"), 
+    plot.subtitle = element_text(face = "italic"),     
+    axis.title = element_text(face = "bold")
+  )
+
+# Time Series Plot for Stream Nitrate Concentration over Years
+ggplot(LTER_acid_deposition_HBES, aes(x = Year, y = Stream_DIN_Concentration, color = Site)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Stream DIC Concentration Over Years",
+    x = "Year",
+    y = "Stream Nitrate Concentration (mg/L)",
+    color = "Site"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "bottom", 
+    legend.direction = "horizontal", 
+    legend.box = "vertical",
+    plot.title = element_text(face = "bold"), 
+    plot.subtitle = element_text(face = "italic"),     
+    axis.title = element_text(face = "bold")
+  )
+
+
+```
+ 

@@ -1,0 +1,269 @@
+---
+title: "**Analyzing IPUMS CPS Data for Fossil Fuel Industries**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+---
+
+# Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Install and load necessary packages
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+# Load Libraries in R Script
+if (!require("pacman")) install.packages("pacman")
+
+# Data manipulation and general utilities
+pacman::p_load(
+  broom, devtools,dplyr, fs, glue, here, htmltools, janitor, knitr, 
+  latex2exp, lubridate, markdown, metajam, magick, png, purrr, RColorBrewer, readr, remotes, 
+  rmarkdown, stringr, tibble, tidyr, tidyverse, units, usethis, readr, readxl, gmp, multcompView, reshape2, htmltools, shiny, car
+)
+
+# Plotting and visualization
+pacman::p_load(
+  # plotting packages 
+  cowplot, DT, ggforce, ggfx, ggimage, gginnards, ggplot2, gganimate, gt, gtExtras,
+  ggpmisc, ggpp, ggpubr, ggrepel, ggsci, ggstatsplot, ggsignif, ggthemes, ggtext,
+  grid, gridExtra, plotly, patchwork, scales, viridis, viridisLite,
+  # table packages
+  gt, gtExtras, gtsummary, kableExtra, 
+  # gis and mapping packages
+  sf, raster, ggmap, tmap, tmaptools, rnaturalearth, rnaturalearthdata
+)
+
+# Environmental Analysis Packages
+
+# Social & Environmental Analysis Packages 
+pacman::p_load(
+  tigris, EDIutils, ineq, ipumsr, tigris, tidycensus, survey
+)
+
+options(tigris_use_cache = TRUE)
+options(readr.show_col_types = FALSE)
+```
+
+# Data Extract & Download 
+The data for this extract were pulled from the IPUMS Current Population Survey (CPS) Annual Social and Economic Supplement (ASEC)](https://cps.ipums.org/) from 1962 to 2023, focusing on variables related to race, industry last year (INDLY), county (FIPS code), and wage and salary income (INCWAGE). These variables were selected to analyze the racial wealth gap over time at the county level, particularly among individuals employed in specific industries, such as fossil fuel workers, allowing for detailed filtering by industry and location.
+
+```{r Loading IPUMS CPS Data}
+
+# NOTE: To load data, you must download both the extract's data and the DDI
+# and also set the working directory to the folder with these files (or change the path below).
+
+# Correct the paths for DDI and data file
+ddi <- read_ipums_ddi(here("Data", "IPUMS_Current_Population_Survey_Data", "IPUMS_CPS_Data_Extract.xml"))
+
+# Load the data using the new data file path
+data <- read_ipums_micro(ddi, data_file = here("Data", "IPUMS_Current_Population_Survey_Data", "IPUMS_CPS_Data_Extract.gz"))
+```
+
+# Cleaning CPS Data & Filtering for Fossil Fuel Industries
+
+```{r CPS Data Wrangling}
+
+# Filter the dataset for the specified state FIPS codes
+filtered_data <- data %>%
+  filter(STATEFIP %in% c(39, 17, 18, 47, 54, 21, 42))
+
+
+# Filter out invalid wage data
+# We filter out INCWAGE values of 99999999 and 99999998 because:
+# 99999999 = N.I.U. (Not in Universe) and 99999998 = Missing (1962-1966 only)
+filtered_data <- filtered_data %>%
+  filter(!(INCWAGE %in% c(99999999, 99999998))) %>% 
+  filter(!is.na(INCWAGE)) %>% 
+  filter(INCWAGE > 0)  # Filter out negative wage values
+
+fossil_fuel_industries <- c(216, 226, 236, 476, 477, 618, 567, 586, 587, 588)
+
+# Filter the dataset for these industries
+filtered_data50 <- filtered_data %>%
+  filter(IND50LY %in% fossil_fuel_industries) %>% 
+  filter(YEAR >= 1960 & YEAR <= 2020)  # Filter the data for the specified years
+
+# View the first few rows of the filtered data
+filtered_data %>% head()
+write_csv(filtered_data, here::here("Outputs", "Summary_Sheets", "IPUMS_CPS_Wages.csv"))
+```
+
+# Summarizing CPS Data & Calculating Racial Wealth Gaps
+
+
+```{r}
+# summarizing by decade 
+decade_data <- filtered_data %>% 
+  group_by(STATEFIP, YEAR, RACE) %>%
+  summarise(mean_wage = mean(INCWAGE, na.rm = TRUE), 
+            median_wage = median(INCWAGE, na.rm = TRUE),
+            .groups = "drop")
+```
+
+```{r Summarizing CPS Data}
+
+# Summarize the racial wealth gap based on state for fossil fuel industries
+state_data <- filtered_data %>% 
+  group_by(STATEFIP, YEAR, RACE) %>% 
+  summarise(mean_wage = mean(INCWAGE, na.rm = TRUE), 
+            # Using median income because of outliers
+            median_wage = median(INCWAGE, na.rm = TRUE),
+            .groups = "drop")
+
+# Create survey design object for person-level analysis with the ASECWT weight
+survey_design <- svydesign(
+  ids = ~PERNUM, 
+  weights = ~ASECWT,  # Use person-level weight for income-related analyses
+  data = filtered_data,
+  na.action = na.omit
+)
+
+# Summarize the racial wealth gap based on state for fossil fuel industries, properly weighted
+state_data <- svyby(
+  ~INCWAGE, 
+  ~STATEFIP + YEAR + RACE, 
+  survey_design, 
+  FUN = svymean, 
+  na.rm = TRUE
+)
+
+# Convert the result to a tibble for easier handling in ggplot
+state_data <- as_tibble(state_data)
+
+# Recode the RACE variable using case_when() and filter the relevant races
+plotting_data <- state_data %>%
+  filter(RACE %in% c(100, 200, 300, 650, 700)) %>%  # Ensure relevant race codes are selected
+  mutate(RACE = case_when(
+    RACE == 100 ~ "White",
+    RACE == 200 ~ "Black",
+    RACE == 300 ~ "American Indian/Aleut/Eskimo",
+    RACE == 650 ~ "Asian or Pacific Islander",
+    RACE == 700 ~ "Other (Single Race)",
+    TRUE ~ as.character(RACE)  # Keep other values as they are
+  )) %>%  # Ensure relevant race codes are selected
+  mutate(STATE = case_when(
+    STATEFIP == 17 ~ "Illinois",
+    STATEFIP == 18 ~ "Indiana",
+    STATEFIP == 21 ~ "Kentucky",
+    STATEFIP == 39 ~ "Ohio",
+    STATEFIP == 42 ~ "Pennsylvania",
+    STATEFIP == 47 ~ "Tennessee",
+    STATEFIP == 54 ~ "West Virginia",
+    TRUE ~ as.character(STATEFIP)  # Keep other values as they are
+  ))
+
+# Plotting the median wage by race over time
+median_wage_plot <- ggplot(plotting_data, aes(x = YEAR, y = INCWAGE, color = RACE)) +
+  geom_line(size = 0.5) +
+  labs(title = "Median Wage by Race Over Time for Fossil Fuel Industries",
+       x = "Year",
+       y = "Median Annual Wage ($)",
+       color = "Race") +
+  theme_minimal() +
+  theme(axis.text.x = 
+          element_text(angle = 45, size=5, hjust = 1),
+        axis.text.y = element_text(size=5),
+        strip.text = element_text(size=5),
+        plot.title = element_text(size=10),
+        legend.position = "right",
+        legend.title = element_text(size = 5),
+        legend.text = element_text(size = 4),
+        plot.background = element_rect(fill = "white")
+        ) +
+  facet_wrap(~STATE)
+
+print(median_wage_plot)
+
+# Saving the plot 
+ggsave(
+  filename = here::here("Outputs", "Plots", "IPUMS_Median_Wage_Per_State.png"),  # Filename as first argument
+  plot = median_wage_plot, 
+  width = 3,  # Width of the plot
+  height = 2,  # Height of the plot
+)
+
+write_csv(state_data, here::here("Outputs", "Summary_Sheets", "IPUMS_CPS_by_Industry_and_Race_data.csv"))
+```
+
+
+```{r}
+# Filter and recode the RACE variable for White and Black
+wealth_gap_data <- state_data %>%
+  filter(RACE %in% c(100, 200)) %>%  # Select only White and Black races
+  mutate(RACE = case_when(
+    RACE == 100 ~ "White",
+    RACE == 200 ~ "Black"
+  ))  %>%  # Ensure relevant race codes are selected
+  mutate(STATE = case_when(
+    STATEFIP == 17 ~ "Illinois",
+    STATEFIP == 18 ~ "Indiana",
+    STATEFIP == 21 ~ "Kentucky",
+    STATEFIP == 39 ~ "Ohio",
+    STATEFIP == 42 ~ "Pennsylvania",
+    STATEFIP == 47 ~ "Tennessee",
+    STATEFIP == 54 ~ "West Virginia",
+    TRUE ~ as.character(STATEFIP)  # Keep other values as they are
+  ))
+
+Black_income_data <- wealth_gap_data %>% 
+  filter(RACE == "Black") %>% 
+  dplyr::select(STATEFIP, STATE, YEAR, BLACK_INCWAGE=INCWAGE, BLACK_INCWAGE_SE=se)
+
+white_income_data <- wealth_gap_data %>% 
+  filter(RACE == "White") %>% 
+  dplyr::select(STATEFIP, STATE, YEAR, WHITE_INCWAGE=INCWAGE, WHITE_INCWAGE_SE=se)
+
+
+# Merge the two datasets on STATEFIP and YEAR
+wealth_gap <- left_join(white_income_data, 
+                        Black_income_data, by = c("STATEFIP", "YEAR", "STATE"))
+
+# Calculate the racial wealth gap
+wealth_gap <- wealth_gap %>%
+  mutate(RACIAL_WEALTH_GAP = WHITE_INCWAGE- BLACK_INCWAGE,
+         RACIAL_WEALTH_GAP_SE = sqrt(WHITE_INCWAGE_SE^2 + BLACK_INCWAGE_SE^2))
+
+# View the results
+print(wealth_gap)
+
+wealth_gap_plot <- ggplot(wealth_gap, aes(x = YEAR, y = RACIAL_WEALTH_GAP, fill = STATE, color=STATE)) +
+  geom_line() +
+  facet_wrap(~STATE)+
+  labs(title = "Racial Wealth Gap Over Time for Fossil Fuel Industries",
+       x = "Year",
+       y = "Racial Wealth Gap ($)",
+       fill = "State") +
+  theme_minimal() +
+  theme(axis.text.x = 
+          element_text(angle = 45, size=5, hjust = 1),
+        strip.text = element_text(size=5),
+        plot.title = element_text(hjust = 0.5, size=10)) +
+  scale_color_viridis(discrete = TRUE)
+
+print(wealth_gap_plot)
+
+# Saving the plot 
+ggsave(
+  filename = here::here("Outputs", "Plots", "IPUMS_Racial_Wealth_Gap_Per_State.png"),  # Filename as first argument
+  plot = wealth_gap_plot, 
+  width = 3,  # Width of the plot
+  height = 2,  # Height of the plot
+)
+
+
+write_csv(wealth_gap, here::here("Outputs", "Summary_Sheets", "IPUMS_CPS_Racial_Wealth_Gap_data.csv"))
+
+```
+

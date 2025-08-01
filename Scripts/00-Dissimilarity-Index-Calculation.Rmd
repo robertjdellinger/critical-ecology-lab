@@ -1,0 +1,194 @@
+---
+title: "**Dissimilarity Index Example**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+header-includes:
+  - |
+    <style>
+      pre, code { font-size: 0.9em; line-height: 1.3; }
+    </style>
+---
+
+
+#Setup 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load necessary libraries
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(tigris)
+library(viridis)
+library(ggplot2)
+library(dplyr)
+```
+
+
+# Residential Segregation Index (Dissimilarity) Map
+
+```{r}
+# Load necessary libraries
+library(tidycensus)
+library(tidyverse)
+library(sf)
+
+# Set parameters
+years <- c(2000, 2010, 2020)
+state <- "IL"
+top_lvl <- "county"  # Top level: county
+btm_lvl <- "tract"   # Bottom level: tract
+
+# Define Census Variable Codes by Year
+census_codes <- list(
+  "2000" = list(total = "P008001", majority = "P008002", minority = "P008003"),
+  "2010" = list(total = "P003001", majority = "P003002", minority = "P003003"),
+  "2020" = list(total = "P1_001N", majority = "P1_002N", minority = "P1_003N")
+)
+
+# Function to fetch and process data for each level and year
+get_census_data <- function(geography, year, codes) {
+  get_decennial(
+    geography = geography,
+    variables = c(
+      n_total = codes$total,
+      n_majority = codes$majority,
+      n_minority = codes$minority
+    ),
+    year = year, state = state, geometry = (geography == "tract")
+  ) %>% 
+    rename_all(tolower) %>% 
+    pivot_wider(names_from = variable, values_from = value) %>%
+    filter(n_total != 0) %>%
+    mutate(
+      p_minority = n_minority / n_total,
+      p_majority = n_majority / n_total,
+      year = year
+    )
+}
+
+# Get top-level (county) data
+top_dat <- map_dfr(years, function(year) {
+  codes <- census_codes[[as.character(year)]]
+  get_census_data(top_lvl, year, codes)
+})
+
+# Get bottom-level (tract) data
+btm_dat <- map_dfr(years, function(year) {
+  codes <- census_codes[[as.character(year)]]
+  get_census_data(btm_lvl, year, codes)
+})
+
+# Validate by summing bottom-level (tract) data and comparing to top-level (county) data
+validate_data <- function(top_data, bottom_data) {
+  top_geo_length <- str_length(unique(top_data$geoid)[1])
+  btm_summarized <- bottom_data %>%
+    mutate(top_geoid = str_sub(geoid, 1, top_geo_length)) %>%
+    group_by(top_geoid, year) %>%
+    summarise(
+      n_total = sum(n_total, na.rm = TRUE),
+      n_majority = sum(n_majority, na.rm = TRUE),
+      n_minority = sum(n_minority, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  validation <- full_join(
+    top_data %>% dplyr::select(geoid, starts_with("n_"), year),
+    btm_summarized,
+    by = c("geoid" = "top_geoid", "year"),
+    suffix = c("_top", "_btm")
+  )
+  
+  if (any(is.na(validation))) stop("Empty entry in validation data!")
+  if (with(validation, any(n_total_top != n_total_btm |
+                           n_majority_top != n_majority_btm |
+                           n_minority_top != n_minority_btm))) {
+    stop("Bottom-level data does not sum up to top-level data!")
+  }
+  print("Data validation successful.")
+}
+
+# Run validation
+validate_data(top_dat, btm_dat)
+
+# Calculate residential segregation indices
+calculate_rs_indices <- function(top_data, bottom_data) {
+  top_geo_length <- str_length(unique(top_data$geoid)[1])
+  
+  btm_with_top_geoid <- bottom_data %>%
+    mutate(top_geoid = str_sub(geoid, 1, top_geo_length)) %>%
+    dplyr::select(-geoid, -name)
+  
+  rs_results <- full_join(
+    top_data %>% dplyr::select(-name),
+    btm_with_top_geoid,
+    by = c("geoid" = "top_geoid", "year"),
+    suffix = c("_top", "_btm")
+  ) %>%
+    filter(n_minority_top != 0, n_majority_top != 0) %>%
+    mutate(
+      d_wb = n_total_btm * abs(p_minority_btm - p_minority_top) / (2 * n_total_top * p_minority_top * (1 - p_minority_top)),
+      int_wb = (n_minority_btm / n_minority_top) * (n_majority_btm / n_total_btm),
+      iso_b = (n_minority_btm / n_minority_top) * (n_minority_btm / n_total_btm)
+    ) %>%
+    group_by(geoid, year) %>%
+    summarize(
+      rs_dissimilarity = sum(d_wb, na.rm = TRUE),
+      rs_interaction = sum(int_wb, na.rm = TRUE),
+      rs_isolation = sum(iso_b, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    right_join(top_data, by = c("geoid", "year")) %>%
+    dplyr::select(geoid, name, year, starts_with("n_"), starts_with("rs_"))
+  
+  return(rs_results)
+}
+
+rs_indices <- calculate_rs_indices(top_dat, btm_dat)
+
+# Set options for tigris
+options(tigris_use_cache = TRUE)
+
+county_boundaries <- counties(state = state, year = 2020, class = "sf")
+
+# Ensure county GEOID matches the format in `rs_indices`
+county_boundaries <- county_boundaries %>%
+  mutate(GEOID = as.character(GEOID))
+
+# Join the `rs_indices` with county boundaries on the county GEOID
+rs_indices_with_geom <- rs_indices %>%
+  inner_join(county_boundaries, by = c("geoid" = "GEOID"))
+
+# Check the output
+print(rs_indices_with_geom)
+
+# You can now proceed with your plotting using `geom_sf()`
+rs_map <- rs_indices_with_geom %>%
+  ggplot(aes(fill = rs_dissimilarity, geometry = geometry)) +
+  geom_sf(color = NA) +
+  scale_fill_viridis_c(
+    name = "Dissimilarity",
+    option = "magma",
+    limits = c(0, 1)
+  ) +
+  theme_minimal() +
+  labs(
+    caption = "Residential Segregation Index (Dissimilarity) at county level",
+    title = "Residential Segregation Index (Dissimilarity) Map"
+  ) +
+  facet_wrap(~ year)
+
+# Display the map
+print(rs_map)
+```
+

@@ -1,0 +1,218 @@
+---
+title: "**Download and Process NHGIS Data**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+---
+
+# Set up
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Download and Process NHGIS Data
+
+```{r}
+library(ipumsr)
+library(dplyr)
+library(purrr)
+
+ipums_data_collections()
+# Load metadata for all available datasets
+all_datasets <- get_metadata_nhgis(type = "datasets")  %>%
+    filter(grepl("1970|1980|1990|2000|2010|2020", name)) %>%  view()
+head(all_datasets)
+
+# Filter for time series tables of interest
+tsts <- get_metadata_nhgis("time_series_tables") %>%
+  filter(
+    grepl("Race", description, ignore.case = TRUE) | 
+    grepl("Income", description, ignore.case = TRUE),
+    geographic_integration == "Standardized to 2010"
+  )
+
+# Unnest 'years' and 'geog_levels' with disambiguation of column names
+unnested_data <- tsts %>%
+    mutate(row_id = row_number()) %>%
+    unnest(years, names_sep = "_year") %>%
+    unnest(geog_levels, names_sep = "_geog")
+
+
+# Convert the tibble to a data frame
+summary_data <- as.data.frame(unnested_data)
+
+# Select and rename the relevant columns
+summary_data <- summary_data[, c("row_id", 
+                                 "name", 
+                                 "description", 
+                                 "years_yearname", 
+                                 "years_yeardescription", 
+                                 "years_yearsequence", 
+                                 "geog_levels_geogname", 
+                                 "geog_levels_geogdescription", 
+                                 "geog_levels_geogsequence")]
+
+# Rename columns
+colnames(summary_data) <- c("row_id", 
+                            "table_name", 
+                            "table_description", 
+                            "year_name", 
+                            "year_description", 
+                            "year_sequence", 
+                            "geog_name", 
+                            "geog_description", 
+                            "geog_sequence")
+
+# View the summary
+print(summary_data) %>% arrange(geog_name)
+```
+```{r}
+# Decennial Census datasets for NGHIS
+census_1960 <- get_metadata_nhgis(dataset = "1980_STF1")
+census_1990 <- get_metadata_nhgis(dataset = "1990_STF1") 
+census_2000 <- get_metadata_nhgis(dataset = "2000_SF1a")
+census_2010 <- get_metadata_nhgis(dataset = "2010_SF1a")
+census_2020 <- get_metadata_nhgis(dataset = "2020_DHCa")
+
+county_SIC_codes <- get_metadata_nhgis(dataset="1970_1971_CBP") # SIC Codes for 1970 for merging with historical NGHIS
+racial_county_demography_1980 <- get_metadata_nhgis(dataset="1980_cASRS") 
+equal_employment_opportunity_1990 <- get_metadata_nhgis(dataset="1980_EEO")
+
+
+
+```
+
+
+# Defining and Submitting NHGIS Extracts
+
+```{r}
+# Define the dataset and variables for extraction
+datasets <- list(
+  ds_spec(
+    name = "2010_SF1a",
+    geog_levels = c("state", "county")  # Adjust based on geographic level of interest
+  )
+)
+
+# Define variables based on your metadata
+vars_to_include <- c("ET1001", "EUD001", "ET2001", "ET2002", "ET2003", "ET2004", 
+                     "ET2005", "ET2006", "ET2007", "ET2008", "ET2009", "ET2010")
+
+# Define the extract request
+nhgis_ext <- define_extract_nhgis(
+  description = "Race and Income data for calculating racial wealth gap",
+  datasets = datasets,
+  time_series_tables = tst_spec("time_series_table_id", vars_to_include)  # Replace "time_series_table_id"
+)
+
+# Submit the extract request
+nhgis_ext_submitted <- submit_extract(nhgis_ext)
+
+# Check the status of the extract
+status <- ipums_extract_info(nhgis_ext_submitted)
+
+# Download the data if the extract is ready
+if (status$status == "completed") {
+  download_extract(nhgis_ext_submitted, path = "path_to_save_file.zip")
+}
+```
+
+
+# Extracting NHGIS Data for Analysis
+
+```{r}
+
+# reload ipums api keyfrom ipumsr package .Renviron
+
+
+# Define the relevant datasets 
+# Geographic Search: (Only need: "IL", "IN", "KY", "OH", "PA", "TN", "WV")
+# Temporal Search: 1960, 1970, 1980, 1990, 2000, 2010, 2020
+
+# Define datasets and data tables for each census year
+tables <- c("NP1", "NP2", "NP10")
+
+# Define datasets and data tables for each census year
+datasets <- list(
+  ds_spec(
+    name = "2010_SF1a",
+     data_tables = tables,
+    geog_levels = c("state")
+  ),
+  ds_spec(
+    name = "2020_DHCa",
+    data_tables = tables,
+    geog_levels = c("state")
+  )
+)
+
+# Define the extract request
+nhgis_extract <- define_extract_nhgis(
+  description = "Wage, income, population, gender, race, and age data across multiple census years",
+  datasets = datasets
+)
+
+# Submit the extract request to IPUMS API
+submitted_extract <- submit_extract(nhgis_extract)
+
+# Wait for the extract to be ready
+# nhgis_extract <- wait_for_extract(submitted_extract)
+
+# Download the extract once it's ready
+zip_path <- download_extract(submitted_extract)
+
+# Unzip the downloaded file to a specific directory
+unzip_dir <- tempdir()  # or specify another directory
+unzip(zip_path, exdir = unzip_dir)
+
+# List the files in the extracted directory
+files <- list.files(unzip_dir, full.names = TRUE)
+
+# Print the files to choose the correct one
+print(files)
+
+# Specify the exact file you want to read (example for tract level)
+tract_file <- files[grep("tract", files)]
+
+# Read the NHGIS data for the specified file
+nhgis_data <- read_nhgis(tract_file)
+
+# Inspect the data
+head(nhgis_data)
+
+```
+
+# Extracting NHGIS Data for Analysis
+
+```{r}
+# Define variables to extract (e.g., income, race, sex)
+variables <- c("INCTOT", "AGE", "RACE", "SEX", "YEAR")
+
+nhgis_extract <- define_extract_nhgis(
+  description = "Example NHGIS extract",
+  datasets = ds_spec("1990_STF3",
+    data_tables = "NP57",
+    geog_levels = c("state", "county", "tract")
+  )
+)  %>%
+  submit_extract() %>%
+  wait_for_extract()
+
+# Assuming the extract has completed, download the extract
+zip_path <- download_extract(nhgis_extract,overwrite = TRUE)
+
+nhgis_data <- download_extract(nhgis_extract, overwrite = TRUE, file_sl) %>%
+  purrr::pluck("data") %>% # Select only the tabular data file to read
+  read_nhgis()  # Read the NHGIS data
+
+```

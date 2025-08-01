@@ -1,0 +1,740 @@
+---
+title: "**Data Wrangling: Querying and Merging EPA Clean Air Markets Program Data (CAMPD)**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+---
+
+
+# Data Wrangling: Querying and Merging EPA Clean Air Markets Program Data (CAMPD)
+
+## Data source & methods
+
+This report explains, step by step, how we gathered, cleaned, combined, and graphed power-plant emission data from EPA’s Clean Air Markets Program Data (CAMPD). First, we downloaded the EPA’s “Facility” files, which tell us where each plant is, what it burns, what pollution controls it uses, and which regulatory programs it’s in. Next, we pulled the yearly emissions totals for sulfur dioxide (\mathrm{SO_2}), nitrogen oxides (\mathrm{NO_x}), and carbon dioxide (\mathrm{CO_2} from 1995 to 2024. We then matched those emissions back to the facility information so every record knows who emitted, where, and when. After checking that locations and county identifiers stayed intact, we rolled the data up to bigger geographies (facility, county, state) so we could map and compare trends. We saved every intermediate file and the final, cleaned datasets so anyone can rerun the work and get the same results.
+
+# Setup Packages
+
+```{r setup-packages, include=FALSE}
+
+# Clean slate
+rm(list = ls())
+
+# Packages
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+library(pacman)
+
+p_load(
+  # wrangling
+  tidyverse, dplyr, tidyr, purrr, stringr, readr, data.table, lubridate, janitor, here, fs,
+  # HTTP / JSON
+  httr, jsonlite,
+  # viz
+  ggplot2, leaflet, scales,
+  # spatial (optional here, but you may map later w/ counties/states)
+  sf, tigris
+)
+
+options(readr.show_col_types = FALSE)
+options(tigris_use_cache = TRUE)
+
+# Output dirs
+out_dir_root  <- here("Data", "EPA_CAMPD_Facility_Summary_Data")
+out_dir_facilities   <- here(out_dir_root, "Facilities_Data")
+out_dir_emissions   <- here(out_dir_root, "Emissions_Data")
+fs::dir_create(c(out_dir_root, out_dir_facilities, out_dir_emissions))
+
+output_path_images <- here("Output", "Figures")
+output_path_tables <- here("Output", "Tables")
+fs::dir_create(c(output_path_images, output_path_tables))
+
+
+# Chunk rendering options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = FALSE,
+  out.width = "100%",
+  fig.align = "center",
+  dpi = 800
+)
+```
+
+
+# Set API Key and Facility Query
+
+```{r facilities-api, include=TRUE, evaluate=FALSE}
+
+# Set your API key here (https://www.epa.gov/power-sector/cam-api-portal)
+api_key <- Sys.getenv("EPA_API_KEY")
+
+# API base URLs
+apiUrlBase <- "https://api.epa.gov/easey"
+bucketUrlBase <- "https://api.epa.gov/easey/bulk-files/"
+selected_states <- c("IL", "IN", "KY", "OH", "PA", "TN", "WV")  # Example states
+
+# Bulk files endpoint (e.g., CAMD Services)
+servicesUrl <- paste0(apiUrlBase,
+                      "/camd-services/bulk-files?API_KEY=", api_key)
+```
+
+# Query EPA CAMPD Facility Data
+
+```{r facility-data-query, echo=TRUE, message=TRUE, warning=FALSE, evaluate=FALSE}
+
+# GET request to the bulk endpoint
+res <- GET(servicesUrl)
+
+# Handle error responses
+if (res$status_code > 399) {
+  errorFrame <- fromJSON(rawToChar(res$content))
+  stop(paste("Error Code:", errorFrame$error$code,
+             errorFrame$error$message))
+}
+
+# Convert the JSON response into a data frame
+bulkFiles <- fromJSON(rawToChar(res$content))
+
+# Confirm available file types
+print(unique(bulkFiles$metadata$dataType))
+
+# Filter for Facility files (corrected label)
+facilityFiles <- bulkFiles[bulkFiles$metadata$dataType == "Facility", ]
+
+# Summary
+message("Number of facility files to download: ", nrow(facilityFiles))
+message("Total size of facility files: ", sum(facilityFiles$megaBytes,
+                                              na.rm = TRUE), " MB")
+
+# Set download directory
+downloadDir <- out_dir_facilities
+
+# Initialize a data table
+facilityDataBulk <- data.table()
+
+# Loop through each new file
+if (nrow(facilityFiles) > 0) {
+  for (i in 1:nrow(facilityFiles)) {
+    s3Path <- facilityFiles[i, "s3Path"]
+    filename <- facilityFiles[i, "filename"]
+    fileURL <- paste0(bucketUrlBase, s3Path)
+    
+    message("Downloading file: ", filename, " from URL: ", fileURL)
+    
+    # Optionally: save to disk
+    # GET(fileURL, write_disk(file.path(downloadDir, filename), overwrite = TRUE))
+
+    # Read data directly into R and clean it
+    tempData <- fread(fileURL, showProgress = TRUE)
+    tempData <- clean_names(tempData)
+    
+    facilityDataBulk <- rbind(facilityDataBulk, tempData, fill = TRUE)
+  }
+  
+  # Sort by year if column exists
+  if ("year" %in% names(facilityDataBulk)) {
+    facilityDataBulk <- facilityDataBulk %>% arrange(year)
+  }
+}
+
+facility_data_cleaned <- facilityDataBulk %>% 
+  filter(state %in% selected_states) %>% 
+  clean_names()
+
+print(facility_data_cleaned)
+
+# Save
+readr::write_csv(facility_data_cleaned, here(out_dir_facilities, "EPA_CAMPD_facilities_data.csv"))
+
+```
+
+
+# Mapping EPA CAMPD Facility Data
+
+Filter out any records missing latitude or longitude, then create an interactive leaflet map.
+
+```{r map-facilities, message=FALSE}
+
+facility_data_loaded <- read_csv(here(out_dir_facilities, "EPA_CAMPD_facilities_data.csv"))
+
+# Convert commercial_operation_date to Date type if needed
+facility_data <- facility_data_loaded %>% 
+  mutate(commercial_operation_date = as.Date(commercial_operation_date))
+
+# Aggregate data by facility (unique facility_id & facility_name)
+facility_summary <- facility_data %>%
+  group_by(state, facility_id, facility_name) %>%
+  summarise(
+    n_units = n_distinct(unit_id), 
+    first_operation = min(commercial_operation_date, na.rm = TRUE),
+    year_range = paste0(min(year, na.rm = TRUE), "-",
+                        max(year, na.rm = TRUE)),
+    latitude = first(latitude),
+    longitude = first(longitude),
+    program_code = first(program_code),
+    operating_status = first(operating_status),
+    .groups = "drop"
+  )
+
+# Inspect summary
+print(facility_summary)
+
+# Filter out facilities with missing coordinates
+facility_map_data <- facility_summary %>% 
+  filter(!is.na(latitude) & !is.na(longitude))
+
+# Define custom awesome markers
+customIcon <- awesomeIcons(
+  icon = "industry",      # facilities
+  iconColor = "white",
+  markerColor = "steelblue",   # Blue markers
+  library = "fa"
+)
+
+leaflet(data = facility_map_data) %>%
+  addProviderTiles("CartoDB.DarkMatter") %>%  # Modern dark basemap
+  addAwesomeMarkers(
+    lng = ~longitude, 
+    lat = ~latitude,
+    icon = customIcon,
+    popup = ~paste0("<strong>", facility_name, "</strong><br>",
+                     "Facility ID: ", facility_id, "<br>",
+                     "State: ", state, "<br>",
+                     "First Operation: ", first_operation, "<br>",
+                     "Year Range: ", year_range, "<br>",
+                     "Program Code: ", program_code, "<br>",
+                     "Units: ", n_units),
+    clusterOptions = markerClusterOptions()  # Enable clustering to improve readability
+  ) %>%
+  addScaleBar(position = "bottomleft") %>%  # Add a scale bar
+  addEasyButton(easyButton(
+    icon = "fa-globe", title = "Reset View",
+    onClick = JS("function(btn, map){ map.setView([39.8283, -98.5795], 4); }")
+  ))
+```
+
+
+# Set API Key and Emissions Query
+
+For each state, we asked the EPA API for all years at once (1995–2024). Because the API only returns a limited number of rows per page, we read how many total rows were available, paged through everything, and stitched the pages together. We saved every state’s results to disk, then read them back in and converted the columns to the correct data types in one go so everything stays consistent.
+
+```{r emissions-api, echo=TRUE, message=TRUE, warning=FALSE}
+
+# Set your API key
+# api_key <- "YOUR_API_KEY_HERE"
+
+# API base URLs
+apiUrlBase <- "https://api.epa.gov/easey"
+# Annual emissions endpoint URL
+annualEmissionsPageUrl <- paste0(apiUrlBase, "/emissions-mgmt/emissions/apportioned/annual?API_KEY=", api_key)
+
+# Selected States
+selected_states <- c("PA", "OH", "IN", "IL", "KY", "TN", "WV") 
+
+# Years
+years <- 1995:2024
+```
+
+# Querying EPA CAMPD Emissions Data 
+
+This document outlines our method for querying annual emissions data from the EPA CAMD API for each state over the period 1995–2024. We construct a query using pipe-separated values for years and state codes, handle pagination to retrieve all records, and save each state's aggregated data as a CSV file.Downloading annual emissions data for each state from 1995 to 2024 from the EPA CAMD API. The data includes information on the Acid Rain Program, Cross-State Air Pollution Rule, and Clean Air Interstate Rule. The data is saved in CSV format for each state and data between 1995 and 2024 is included. The code handles pagination to ensure all data is retrieved, and it prints the total number of records for each state. The API key must be set before running the code.
+
+```{r emissions-data-query, echo=TRUE, message=TRUE, warning=FALSE, evaluate=FALSE}
+
+# Helper to read x-total-count robustly
+get_total_count <- function(res) {
+  h <- names(res$headers)
+  i <- which(tolower(h) == "x-total-count")
+  if (!length(i)) return(NA_real_)
+  suppressWarnings(as.numeric(res$headers[[i[1]]]))
+}
+
+# Small safe JSON parser
+safe_fromJSON <- function(raw_txt) {
+  tryCatch(jsonlite::fromJSON(raw_txt), error = function(e) NULL)
+}
+
+# Loop through each selected state
+for (st in selected_states) {
+  message("Processing state: ", st)
+
+  # Build query parameters with pipe-separated years
+  query <- list(
+    year      = paste(years, collapse = '|'),
+    stateCode = st,
+    page      = 1,
+    perPage   = 100 # 500 is the maximum per page
+  )
+
+  # Make an initial GET request to determine the total number of records
+  res <- GET(annualEmissionsPageUrl, query = query)
+  if (res$status_code > 399) {
+    errorFrame <- safe_fromJSON(rawToChar(res$content))
+    stop(paste(
+      "HTTP", res$status_code, "->",
+      if (!is.null(errorFrame) && !is.null(errorFrame$error$message))
+        errorFrame$error$message
+      else rawToChar(res$content)
+    ))
+  }
+
+  totalRowsAvailableForQuery <- get_total_count(res)
+  if (is.na(totalRowsAvailableForQuery)) totalRowsAvailableForQuery <- 0
+
+  message("Total records for ", st, ": ", totalRowsAvailableForQuery)
+
+  if (totalRowsAvailableForQuery == 0) {
+    message("No rows returned for ", st, ". Skipping…")
+    next
+  }
+
+  # Calculate total pages required
+  totalPages <- ceiling(totalRowsAvailableForQuery / query$perPage)
+  message("Total pages to fetch: ", totalPages)
+
+  # Pre-allocate list
+  allData <- vector("list", totalPages)
+  page <- 1
+
+  # Loop through pages until all pages are fetched
+  while (page <= totalPages) {
+    query$page <- page
+    res <- GET(annualEmissionsPageUrl, query = query)
+
+    if (res$status_code > 399) {
+      errorFrame <- safe_fromJSON(rawToChar(res$content))
+      stop(paste(
+        "HTTP", res$status_code, "->",
+        if (!is.null(errorFrame) && !is.null(errorFrame$error$message))
+          errorFrame$error$message
+        else rawToChar(res$content)
+      ))
+    }
+
+    dataPage <- safe_fromJSON(rawToChar(res$content))
+
+    if (is.null(dataPage) || (is.data.frame(dataPage) && nrow(dataPage) == 0)) {
+      message("Empty page (", page, "). Breaking.")
+      break
+    }
+
+    allData[[page]] <- tibble::as_tibble(dataPage)
+    message("Fetched page ", page, " / ", totalPages)
+    page <- page + 1
+
+    Sys.sleep(0.25)  # be nice to the API
+  }
+
+  # Combine all pages into a single data frame
+  combinedAnnualEmissData <- dplyr::bind_rows(allData) %>%
+    clean_names()
+  print(combinedAnnualEmissData, n = 3)
+
+  # Write the data to a CSV file for the current state
+  outputFile <- here::here(
+    "Data", "EPA_CAMPD_Facility_Summary_Data", "Emissions_Data",
+    paste0("EPA_CAMPD_Annual_Emissions_", st, "_", min(years),
+           "_", max(years), ".csv")
+  )
+  dir.create(dirname(outputFile), recursive = TRUE, showWarnings = FALSE)
+  readr::write_csv(combinedAnnualEmissData, outputFile)
+  message("Saved file: ", outputFile)
+}
+files <- dir_ls(
+  here("Data", "EPA_CAMPD_Facility_Summary_Data", "Emissions_Data"),
+  regexp = "^.*/EPA_CAMPD_Annual_Emissions_[A-Z]{2}_[0-9]{4}_[0-9]{4}\\.csv$"
+)
+
+stopifnot(length(files) > 0)
+
+read_one_chr <- function(f) {
+  st <- str_match(basename(f), "EPA_CAMPD_Annual_Emissions_([A-Z]{2})_")[, 2]
+  read_csv(
+    f,
+    col_types = cols(.default = col_character()),
+    progress  = FALSE
+  ) %>%
+    mutate(stateCode = dplyr::coalesce(state_code, st),
+           .file     = basename(f))  # keep provenance if useful
+}
+
+combined_chr <- purrr::map_dfr(files, read_one_chr)
+
+# Let readr guess types once, consistently
+combined_annual_emissions <- type_convert(combined_chr, guess_integer = TRUE)
+```
+
+# Combined EPA CAMPD Facility/Emissions Data
+
+We connected the emissions to the facility details using the shared identifiers (state code, facility and unit IDs, stacks, and year). After merging, we verified that coordinates and county codes were still present and valid.
+
+```{r combined-emissions-data}
+
+facility_info <- read_csv(here("Data", "EPA_CAMPD_Facility_Summary_Data", "Facilities_Data", "EPA_CAMPD_facilities_data.csv")) %>% 
+  dplyr::filter(between(year, 1995, 2024))
+
+fac_attrs <- facility_info %>%
+  dplyr::select(
+    county_code, facility_name, facility_id, unit_id, associated_stacks,
+    year, program_code, operating_status, commercial_operation_date,
+    source_category, latitude, longitude
+  ) %>%
+  tidyr::extract(
+    county_code,
+    into = c("state_code", "county_fips"),
+    regex = "^([A-Za-z]{2})(\\d{3})$",
+    remove = TRUE
+  )  %>%
+  mutate(
+    state_code  = as.character(state_code), 
+    facility_id = as.integer(facility_id),
+    unit_id     = as.character(unit_id),
+    year        = as.integer(year)
+  )
+
+combined_facility_emissions <- combined_annual_emissions %>%
+  dplyr::select(-secondary_fuel_info, -so2control_info, -nox_control_info, -pm_control_info, -hg_control_info) %>%
+  left_join(
+    fac_attrs,
+    by = c("state_code", "facility_id", "facility_name",
+           "associated_stacks", "unit_id", "year")
+  )
+
+write_csv(
+  combined_facility_emissions,
+  here("Output", "Sheets", "CAMPD_facility_summaries_1995_2020.csv")
+)
+```
+
+# Visualizing EPA CAMPD Emissions Data
+
+```{r visualizing-CAMPD-emissions}
+
+states_of_interest <- c("IL","IN","KY","OH","PA","TN","WV")
+
+# grab state boundaries for context
+states_filtered <- tigris::states(cb = TRUE, year = 2020, class = "sf") %>%
+  filter(STUSPS %in% states_of_interest) %>%
+  st_transform(4326)
+
+# helper for parsed labels
+chem_expr <- function(pol) {
+  switch(pol,
+         "SO2" = quote(SO[2]),
+         "NOX" = quote(NO[x]),
+         "CO2" = quote(CO[2]),
+         as.name(pol))
+}
+
+# choose the pollutants (columns in your data)
+pollutants <- c(SO2 = "so2mass", NOX = "nox_mass", CO2 = "co2mass")
+
+# pick “milestone” years, adjust if you want more/less
+years_keep <- c(1995, 2000, 2005, 2010, 2015, 2020, 2024)
+
+# make a long table: state-year-facility-unit-pollutant, mass
+camdp_long <- combined_facility_emissions %>%
+  filter(state_code %in% states_of_interest,
+         year %in% years_keep) %>%
+  dplyr::select(
+    state_code, year, facility_id, facility_name,
+    unit_id, latitude, longitude,
+    so2mass, nox_mass, co2mass
+  ) %>%
+  pivot_longer(cols = c(so2mass, nox_mass, co2mass),
+               names_to = "pollutant_var", values_to = "mass") %>%
+  mutate(
+    pollutant = recode(pollutant_var,
+                       so2mass = "SO2",
+                       nox_mass = "NOX",
+                       co2mass = "CO2")
+  )
+
+# sum to facility (not unit) per year/pollutant
+facility_year_pol <- camdp_long %>%
+  group_by(state_code, year, pollutant, facility_id,
+           facility_name, latitude, longitude) %>%
+  summarise(total_emissions = sum(mass, na.rm = TRUE), .groups = "drop") %>%
+  filter(is.finite(latitude), is.finite(longitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# a generic bubble plot (SO2 / NOX / CO2)
+bubble_plot_camdp <- function(df, pol,
+                              color      = "royalblue1",
+                              years      = years_keep,
+                              cap_pct    = 0.99,
+                              max_size   = 1.2,
+                              alpha      = 0.25,
+                              xlim       = c(-92.5, -72.5),
+                              ylim       = c(34, 44)) {
+
+  lab_short <- scales::label_number(scale_cut = scales::cut_short_scale())
+
+  df_pol <- df %>%
+    filter(pollutant == pol,
+           total_emissions > 0,
+           year %in% years) %>%
+    mutate(year = factor(year, levels = years))
+
+  if (!nrow(df_pol))
+    return(ggplot() + theme_void() + ggtitle(paste(pol, "- no data")))
+
+  upper <- as.numeric(quantile(df_pol$total_emissions, cap_pct, na.rm = TRUE))
+  lower <- min(df_pol$total_emissions[df_pol$total_emissions > 0],
+               na.rm = TRUE)
+
+  df_pol <- df_pol %>%
+    mutate(total_emissions_plot = pmin(pmax(total_emissions, lower), upper))
+
+  # 4–5 breaks works well
+  brks <- scales::breaks_log(n = 5)(c(lower, upper))
+
+  ggplot() +
+    geom_sf(data = states_filtered, fill = NA, color = "grey20",
+            linewidth = 0.2) +
+    geom_sf(data = df_pol,
+            aes(size = total_emissions_plot),
+            color = color, alpha = alpha, show.legend = TRUE) +
+    coord_sf(xlim = xlim, ylim = ylim, expand = FALSE, datum = NA) +
+    scale_size_continuous(
+      range  = c(0, max_size),
+      limits = c(lower, upper),
+      trans  = "log10",
+      breaks = brks,
+      labels = lab_short,
+      name   = "Emissions (tons, capped)"
+    ) +
+    facet_wrap(~ year, drop = FALSE) +
+    labs(
+      title = bquote(.(chem_expr(pol)) ~ "Emissions by Facility (EPA CAMD)"),
+      subtitle = "Distribution & Intensity (tons)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      legend.position = "bottom",
+      plot.title      = element_text(hjust = 0.5),
+      plot.subtitle   = element_text(hjust = 0.5),
+      panel.background  = element_rect(fill = NA, colour = NA),
+      plot.background   = element_rect(fill = NA, colour = NA),
+      legend.background = element_rect(fill = NA, colour = NA)
+    )
+}
+
+p_so2 <- bubble_plot_camdp(facility_year_pol, "SO2", color = "royalblue1")
+p_nox <- bubble_plot_camdp(facility_year_pol, "NOX", color = "orange")
+p_co2 <- bubble_plot_camdp(facility_year_pol, "CO2", color = "orangered")
+
+print(p_so2)
+print(p_nox)
+print(p_co2)
+
+ggsave(here::here("Output", "Figures", "EPA_CAMD_facility_SO2_distribution_intensity.png"),
+       p_so2, width = 9, height = 6.5, dpi = 600)
+ggsave(here::here("Output", "Figures", "EPA_CAMD_facility_NOX_distribution_intensity.png"),
+       p_nox, width = 9, height = 6.5, dpi = 600)
+ggsave(here::here("Output", "Figures", "EPA_CAMD_facility_CO2_distribution_intensity.png"),
+       p_co2, width = 9, height = 6.5, dpi = 600)
+```
+
+
+```{r mapping-CAMPD-emissions}
+
+# Get county polygons 
+counties_sf <- tigris::counties(state = states_of_interest,
+       cb = TRUE, year = 2020, class = "sf")  %>% 
+  st_transform(4326) %>% 
+  janitor::clean_names()
+
+state_lu <- tigris::fips_codes %>%
+  dplyr::select(state = state, state_fips2 = state_code) %>%
+  dplyr::distinct()
+
+county_totals <- combined_facility_emissions %>%
+  # keep only states you’ll map (optional)
+  dplyr::filter(state_code %in% states_of_interest) %>%
+  # make sure numeric
+  dplyr::mutate(
+    so2mass  = as.numeric(so2mass),
+    nox_mass = as.numeric(nox_mass),
+    co2mass  = as.numeric(co2mass)
+  ) %>%
+  tidyr::pivot_longer(
+    c(so2mass, nox_mass, co2mass),
+    names_to = "pollutant_var", values_to = "mass"
+  ) %>%
+  dplyr::mutate(
+    pollutant = dplyr::recode(pollutant_var,
+      so2mass = "SO2", nox_mass = "NOX", co2mass = "CO2"
+    )
+  ) %>%
+  # add 2-digit state FIPS so we can form a 5-digit GEOID
+  dplyr::left_join(state_lu, by = c("state_code" = "state")) %>%
+  dplyr::mutate(
+    geoid = sprintf("%02s%03s", state_fips2, county_fips)
+  ) %>%
+  dplyr::group_by(geoid, pollutant) %>%
+  dplyr::summarise(total_emissions = sum(mass, na.rm = TRUE), .groups = "drop")
+
+pollutant_labs <- c(SO2 = "SO[2]", NOX = "NO[x]", CO2 = "CO[2]")
+
+make_county_map <- function(counties_sf, county_totals, pol, option = "C") {
+
+  df_pol <- counties_sf %>%
+    left_join(
+      county_totals %>% filter(toupper(pollutant) == toupper(pol)),
+      by = "geoid"
+    ) %>%
+    filter(is.finite(total_emissions), total_emissions > 0)   # <- drop zeros/negatives
+
+  if (!nrow(df_pol)) return(ggplot() + theme_void() + 
+                              ggtitle(paste(pol, "- no data")))
+  
+  pos_vals <- df_pol$total_emissions
+  rng <- range(pos_vals, na.rm = TRUE)
+  log10_breaks <- function(rng, n = 5) {
+    lo <- floor(log10(rng[1])); 
+    hi <- ceiling(log10(rng[2])); if (lo == hi) hi <- lo + 1
+    10^(unique(round(seq(lo, hi, length.out = n))))
+  }
+  brks <- log10_breaks(rng, n = 5)
+
+  ggplot(df_pol) +
+    geom_sf(aes(fill = total_emissions), color = NA) +
+    scale_fill_viridis_c(
+      option = option,
+      trans  = "log10",
+      breaks = brks,
+      limits = range(brks),
+      na.value = "grey95",
+      name = "Emissions (Tons, log10)"
+    ) +
+    labs(
+      title = bquote("Facility-Level Emissions by County, Total 1995–2024: " *
+                       .(parse(text = pollutant_labs[[toupper(pol)]]))),
+      subtitle = "EPA CAMD — Summed Facility Totals; IL, IN, KY, OH, PA, TN, WV",
+      caption  = "Projection: WGS84 / EPSG:4326"
+    ) +
+    guides(fill = guide_colorbar(
+      title.position = "top",
+      barwidth = unit(15, "cm"),
+      barheight = unit(0.4, "cm"),
+      ticks = FALSE
+    )) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid       = element_blank(),
+      axis.title       = element_blank(),
+      legend.position  = "bottom",
+      legend.title     = element_text(margin = margin(b = 4)),
+      panel.background  = element_rect(fill = NA, colour = NA),
+      plot.background   = element_rect(fill = NA, colour = NA),
+      legend.background = element_rect(fill = NA, colour = NA)
+    )
+}
+
+
+# Build + save each map
+
+p_so2 <- make_county_map(counties_sf, county_totals, "SO2")
+p_nox <- make_county_map(counties_sf, county_totals, "NOX")
+p_co2 <- make_county_map(counties_sf, county_totals, "CO2")
+
+print(p_so2)
+print(p_nox)
+print(p_co2)
+
+```
+
+```{r visualizing-CAMPD-emissions-trends}
+
+states_of_interest <- c("IL","IN","KY","OH","PA","TN","WV")
+
+# Aggregate to state × year for the three pollutants
+state_year_long <- combined_facility_emissions %>%
+  filter(state_code %in% states_of_interest) %>%
+  transmute(
+    state_code, year,
+    so2 = as.numeric(so2mass),
+    nox = as.numeric(nox_mass),
+    co2 = as.numeric(co2mass)
+  ) %>%
+  group_by(state_code, year) %>%
+  summarise(
+    so2 = sum(so2, na.rm = TRUE),
+    nox = sum(nox, na.rm = TRUE),
+    co2 = sum(co2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(so2, nox, co2),
+    names_to = "pollutant",
+    values_to = "total_tons"
+  ) %>%
+  mutate(
+    pollutant = toupper(pollutant),
+    pollutant_lab = dplyr::recode(pollutant,
+      "SO2" = "SO[2]",
+      "NOX" = "NO[x]",
+      "CO2" = "CO[2]"
+    )
+  )
+
+subtitle_expr <- bquote("Summed across facilities/units — "
+                        * SO[2] * ", " * NO[x] * ", and " * CO[2]
+                        * " (1995–2024)")
+
+# Palette (one distinct color per state)
+pal_states <- scales::hue_pal()(length(states_of_interest))
+names(pal_states) <- states_of_interest
+
+# Faceted plot (one panel per pollutant)
+p_all <- ggplot(state_year_long,
+                aes(x = year, y = total_tons,
+                    color = state_code, group = state_code)) +
+  geom_line(linewidth = 0.5, alpha = 0.7) +
+  geom_point(size = 1) +
+  scale_color_manual(values = pal_states, name = "State") +
+  scale_y_continuous(labels = scales::comma) +
+  facet_wrap(~ pollutant_lab, scales = "free_y", 
+             labeller = label_parsed, ncol =1) +
+  labs(
+    title    = "State-Level Power Sector Emissions Over Time (EPA CAMD)",
+    subtitle = subtitle_expr,
+    x = NULL,
+    y = "Emissions (tons)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position   = "bottom",
+    panel.grid.minor  = element_blank(),
+    strip.text        = element_text(face = "bold"),
+    panel.background  = element_rect(fill = NA, colour = NA),
+    plot.background   = element_rect(fill = NA, colour = NA),
+    legend.background = element_rect(fill = NA, colour = NA)
+  )
+
+print(p_all)
+
+# write out the plot
+ggsave(here::here("Output", "Figures", "EPA_CAMPD_state_emissions_trends.png"),
+       p_all, width = 9, height = 6.5, dpi = 600)
+```
+
+
+# Citations
+
+United States Environmental Protection Agency (EPA). “Power Sector Emissions Data.” Washington, DC: Office of Atmospheric Programs, Clean Air Markets Division. Available from EPA’s Air Markets Program Data web site: https://ampd.epa.gov.
+
+
+United States Environmental Protection Agency (EPA). “Clean Air Markets Program Data.” Washington, DC: Office of Atmospheric Protection, Clean Air Markets Division. Available from EPA’s Air Markets Program Data web site: https://campd.epa.gov/.
+
+
+
+
+

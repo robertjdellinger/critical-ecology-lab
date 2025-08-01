@@ -1,0 +1,598 @@
+---
+title: "**Data Wrangling: Querying Census Data**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+header-includes:
+  - |
+    <style>
+      pre, code { font-size: 0.9em; line-height: 1.3; }
+    </style>
+---
+
+
+# Introduction
+
+This script outlines a comprehensive methodology for downloading, processing, and visualizing racial demographic and income distribution data from the American Community Survey (ACS) and Decennial Census across multiple states. The process is designed to ensure both reproducibility and accessibility, following best practices in data collection, cleaning, and visualization. By leveraging the get_state_race_data and get_income_data functions, the script streamlines the download and preprocessing of data, ensuring that it is properly formatted and cleaned for analysis. This approach provides an efficient, standardized framework for obtaining and analyzing ACS and Decennial Census data related to racial and income demographics across geographic regions.
+
+## Setup Packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Install and load pacman to streamline package management
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+
+# Core packages only (trimmed to what this script uses)
+pacman::p_load(
+  dplyr, tidyr, purrr, readr, stringr, tibble, glue, janitor, here,
+  sf, tigris, tidycensus, knitr, rmarkdown, future, tidyverse, 
+  tigris, # For FIPS codes and geographic data
+  tidycensus, # For accessing Census and ACS data
+  purrr,  # For functional programming
+  furrr, parallelly # For parallel processing
+)
+
+out_dir <- here::here("Output", "Figures")
+
+# Tigris and tidycensus options
+options(tigris_class = "sf", tigris_use_cache = TRUE, readr.show_col_types = FALSE)
+
+# Optional: check for a Census API key and give a friendly note if missing
+if (Sys.getenv("CENSUS_API_KEY") == "") {
+  message("No CENSUS_API_KEY found. Set one with tidycensus::census_api_key('YOUR_KEY', install = TRUE).")
+}
+```
+
+
+
+# ACS Population Racial Demography Download 
+
+This section retrieves racial demographic data from the American Community Survey (ACS) for several states. The data is downloaded at the Census Tract level and includes variables for race and ethnicity categories. The function get_state_race_data is applied for each state to process the data. Data is retrieved using the tidycensus package with error handling to ensure robustness. 
+
+```{r download-example-race}
+# Define the states to analyze
+states <- c("IL", "IN", "OH", "KY", "WV", "PA", "TN")
+
+# Define the race variables for ACS
+race_vars <- c(
+  White = "B03002_003",
+  Black = "B03002_004",
+  Native = "B03002_005",
+  Asian = "B03002_006",
+  HIPI = "B03002_007",
+  Hispanic = "B03002_012"
+)
+
+# Function to download and process ACS data for each state
+get_state_race_data <- function(state, acs_year = 2020) {
+  tryCatch({
+    get_acs(
+      geography = "tract",
+      state = state,
+      variables = race_vars,
+      summary_var = "B03002_001",
+      year = acs_year,
+      geometry = TRUE
+    ) %>%
+      clean_names() %>% 
+      mutate(percent = 100 * (estimate / summary_est)) %>%
+      select(geoid, name, variable, percent, geometry) 
+  }, error = function(e) {
+    message(paste("Error in downloading data for", state, "in", acs_year))
+    return(NULL)
+  })
+}
+
+# Create an empty list to store results
+all_race_data <- list()
+
+# Loop through each state to get the data
+for (state in states) {
+  state_race_data <- get_state_race_data(state)
+  
+  # If the data is not null, add it to the list
+  if (!is.null(state_race_data)) {
+    all_race_data[[state]] <- state_race_data
+  }
+}
+
+# Combine all the state data into a single data frame
+ACS_race_data_combined <- bind_rows(all_race_data, .id = "state")
+
+# Check the combined data
+glimpse(ACS_race_data_combined)
+
+# Plot the geometry of Block Groups in Illinois for racial population percentage
+ACS_race_data_plot <- ACS_race_data_combined %>%
+  ggplot() +
+  geom_sf(aes(fill = percent), color = NA, size = 0.1) +  # Added white border around polygons
+  facet_wrap(~ variable) +  # Scales free to adjust based on each variable's range
+  scale_fill_viridis_c(option = "D", begin = 0.1, end = 0.9) +  # Enhanced viridis color palette for better contrast
+  theme_minimal(base_size = 14) +  # Increased base font size for readability
+  ggtitle("Population Percentage by Racial Category (ACS Survey 2016-2020)") + 
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 10),  # Improve facet labels
+    axis.text = element_text(size = 10)  # Enhance axis text visibility
+  ) +
+  labs(fill = "Percentage of Population")  # Label the color legend
+
+# Save the plot to a file
+ggsave(here("Output", "Figures", "ACS_race_data_example_plot.png"), plot = ACS_race_data_plot, width = 10, height = 8, dpi = 300)
+
+```
+
+# ACS Income Data Download
+
+This section downloads income data from the ACS using the B19001 table, which contains data for household income categories. The data is processed by income groups (below35k, bw35kand75k, above75k), and geographic boundaries are retained.
+
+```{r downlaod-example-income}
+
+# Function to download and process income data without geometry
+get_income_data <- function(state, acs_year = 2020) {
+  tryCatch({
+    get_acs(
+      geography = "tract",
+      table = "B19001",
+      state = state,
+      year = acs_year,
+      geometry = TRUE  # No geometry
+    ) %>%
+      clean_names() %>%
+      dplyr::filter(variable != "B19001_001") %>%
+      mutate(incgroup = case_when(
+        variable < "B19001_008" ~ "below35k", 
+        variable < "B19001_013" ~ "bw35kand75k", 
+        TRUE ~ "above75k"
+      )) %>%
+      group_by(geoid, incgroup) %>%
+      summarize(estimate = sum(estimate))
+  }, error = function(e) {
+    message(paste("Error in downloading income data for", state, "in", acs_year))
+    return(NULL)
+  })
+}
+
+# Loop through each state and combine the income data
+ACS_income_data <- purrr::map_dfr(states, ~get_income_data(.x, acs_year = 2020))
+
+# Check the updated data
+glimpse(ACS_income_data)
+
+# Plot the geometry of Block Groups with income data by state
+ACS_income_data_plot <- ACS_income_data %>%
+  ggplot() +
+  geom_sf(aes(fill = estimate), color = NA, size = 0.1) +  # Added white border around polygons and mapped income data
+  facet_wrap(~ incgroup) +  # Facet by income group
+  scale_fill_viridis_c(option = "D", begin = 0.1, end = 0.9) +  # Enhanced viridis color palette for better contrast
+  theme_minimal(base_size = 12) +  # Increased base font size for readability
+  ggtitle("Income Distribution by Income Group (ACS Survey 2016-2020)") + 
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 10),  # Improve facet labels
+    axis.text = element_text(size = 10)  # Enhance axis text visibility
+  ) +
+  labs(fill = "Estimate of Income Group")  # Label the color legend
+ 
+print(ACS_income_data_plot)
+```
+
+### ACS Data by Block Group, Census Tract, and County 
+(2005-2009, 2010-2014, 2015-2019)
+
+```{r acs-block-group-download, message=FALSE}
+# Define the states to analyze
+states <- c("IL", "IN", "OH", "KY", "WV", "PA", "TN")
+
+# Define year ranges and corresponding ACS survey periods
+year_ranges <- c(2009, 2014, 2019)
+survey_periods <- c("2005-2009", "2010-2014", "2015-2019")
+acs_svy <- "acs5"  # ACS 5-year survey, change as needed
+acs_geo <- "block group"  # Geography level for block groups
+
+# Define the racial demographic variables from the ACS dataset
+race_vars <- c(
+  White = "B03002_003", 
+  Black = "B03002_004",
+  Native = "B03002_005",
+  Asian = "B03002_006",
+  HIPI = "B03002_007",
+  Hispanic = "B03002_012"
+)
+
+# Function to download and process data for a given state, year, and geography level
+get_state_race_data <- function(state, acs_year = 2009, acs_geo = "block group") {
+  tryCatch({
+    get_acs(
+      geography = acs_geo,
+      survey = acs_svy,  
+      year = acs_year,
+      state = state,
+      variables = race_vars,
+      summary_var = "B03002_001"
+    ) %>%
+      clean_names() %>% 
+      mutate(percent = 100 * (estimate / summary_est)) %>%
+      select(geoid, name, variable, percent)
+  }, error = function(e) {
+    message(paste("Error in downloading data for", state, "in", acs_year))
+    return(NULL)
+  })
+}
+
+# Create an empty list to store the results for Census Tract level
+all_race_data_tract <- list()
+
+# Loop over the year ranges and ACS survey periods for Census Tract
+for (i in 1:length(year_ranges)) {
+  acs_year <- year_ranges[i]
+  acs_survey_period <- survey_periods[i]
+  
+  # Apply the function to each state and combine the results
+  state_race_data_tract <- purrr::map_dfr(states, ~get_state_race_data(.x, acs_year = acs_year, acs_geo = "block group"))
+  
+  # Add the ACS survey period to the dataset
+  if (!is.null(state_race_data_tract)) {
+    all_race_data_tract[[i]] <- state_race_data_tract %>%
+      mutate(ACS_survey = acs_survey_period)
+  }
+}
+
+# Combine all datasets into one for Block Group level
+ACS5_population_race_block_group <- bind_rows(all_race_data_tract)
+
+# Define the output path and filename for Block Group
+output_path_block_group <- here("Output", "Sheets", "ACS5_population_racial_demography_block_group_2005_2019.csv")
+
+# Save the resulting dataset to a CSV file in the specified location for Block Group
+write.csv(ACS5_population_race_block_group, file = output_path_block_group, row.names = FALSE)
+
+# View a summary of the resulting dataset for Block Group
+glimpse(ACS5_population_race_block_group)
+
+```
+
+
+
+
+```{r acs-tract-download, message=FALSE}
+# Define the states to analyze and set relevant parameters
+states <- c("IL", "IN", "OH", "KY", "WV", "PA", "TN")
+
+# Define year ranges and corresponding ACS survey periods
+year_ranges <- c(2009, 2014, 2019)
+survey_periods <- c("2005-2009", "2010-2014", "2015-2019")
+acs_svy <- "acs5"  # ACS 5-year survey, change as needed
+
+# Define the racial demographic variables from the ACS dataset
+race_vars <- c(
+  White = "B03002_003", 
+  Black = "B03002_004",
+  Native = "B03002_005",
+  Asian = "B03002_006",
+  HIPI = "B03002_007",
+  Hispanic = "B03002_012"
+)
+
+# Function to download and process data for a given state, year, and geography level
+get_state_race_data <- function(state, acs_year = 2009, acs_geo = "tract") {
+  tryCatch({
+    get_acs(
+      geography = acs_geo,
+      survey = acs_svy,  
+      year = acs_year,
+      state = state,
+      variables = race_vars,
+      summary_var = "B03002_001"
+    ) %>%
+      clean_names() %>% 
+      mutate(percent = 100 * (estimate / summary_est)) %>%
+      select(geoid, name, variable, percent)
+  }, error = function(e) {
+    message(paste("Error in downloading data for", state, "in", acs_year))
+    return(NULL)
+  })
+}
+
+# Create an empty list to store the results for Census Tract level
+all_race_data_tract <- list()
+
+# Loop over the year ranges and ACS survey periods for Census Tract
+for (i in 1:length(year_ranges)) {
+  acs_year <- year_ranges[i]
+  acs_survey_period <- survey_periods[i]
+  
+  # Apply the function to each state and combine the results
+  state_race_data_tract <- purrr::map_dfr(states, ~get_state_race_data(.x, acs_year = acs_year, acs_geo = "tract"))
+  
+  # Add the ACS survey period to the dataset
+  if (!is.null(state_race_data_tract)) {
+    all_race_data_tract[[i]] <- state_race_data_tract %>%
+      mutate(ACS_survey = acs_survey_period)
+  }
+}
+
+# Combine all datasets into one for Census Tract level
+ACS5_population_race_tract <- bind_rows(all_race_data_tract)
+
+# Define the output path and filename for Census Tract
+output_path_tract <- here("Output", "Sheets", "ACS5_population_racial_demography_tract_2005_2019.csv")
+
+# Save the resulting dataset to a CSV file in the specified location for Census Tract
+write.csv(ACS5_population_race_tract, file = output_path_tract, row.names = FALSE)
+
+# View a summary of the resulting dataset for Census Tract
+glimpse(ACS5_population_race_tract)
+```
+
+```{r acs-county-download, message=FALSE}
+# Define the states to analyze and set relevant parameters
+states <- c("IL", "IN", "OH", "KY", "WV", "PA", "TN")
+
+# Define year ranges and corresponding ACS survey periods
+year_ranges <- c(2009, 2014, 2019)
+survey_periods <- c("2005-2009", "2010-2014", "2015-2019")
+acs_svy <- "acs5"  # ACS 5-year survey, change as needed
+
+# Define the racial demographic variables from the ACS dataset
+race_vars <- c(
+  White = "B03002_003", 
+  Black = "B03002_004",
+  Native = "B03002_005",
+  Asian = "B03002_006",
+  HIPI = "B03002_007",
+  Hispanic = "B03002_012"
+)
+
+# Function to download and process data for County level (change geography)
+get_state_race_data_county <- function(state, acs_year = 2009, acs_geo = "county") {
+  tryCatch({
+    get_acs(
+      geography = acs_geo,
+      survey = acs_svy,  
+      year = acs_year,
+      state = state,
+      variables = race_vars,
+      summary_var = "B03002_001"
+    ) %>%
+      clean_names() %>% 
+      mutate(percent = 100 * (estimate / summary_est)) %>%
+      select(geoid, name, variable, percent)
+  }, error = function(e) {
+    message(paste("Error in downloading data for", state, "in", acs_year))
+    return(NULL)
+  })
+}
+
+# Create an empty list to store the results for County level
+all_race_data_county <- list()
+
+# Loop over the year ranges and ACS survey periods for County
+for (i in 1:length(year_ranges)) {
+  acs_year <- year_ranges[i]
+  acs_survey_period <- survey_periods[i]
+  
+  # Apply the function to each state and combine the results
+  state_race_data_county <- purrr::map_dfr(states, ~get_state_race_data_county(.x, acs_year = acs_year, acs_geo = "county"))
+  
+  # Add the ACS survey period to the dataset
+  if (!is.null(state_race_data_county)) {
+    all_race_data_county[[i]] <- state_race_data_county %>%
+      mutate(ACS_survey = acs_survey_period)
+  }
+}
+
+# Combine all datasets into one for County level
+ACS5_population_race_county <- bind_rows(all_race_data_county)
+
+# Define the output path and filename for County level
+output_path_county <- here("Output", "Sheets", "ACS5_population_racial_demography_county_2005_2019.csv")
+
+# Save the resulting dataset to a CSV file in the specified location for County
+write.csv(ACS5_population_race_county, file = output_path_county, row.names = FALSE)
+
+# View a summary of the resulting dataset for County
+glimpse(ACS5_population_race_county)
+```
+
+
+## Downloading Decenial Census Data 
+
+This section retrieves Decennial Census Data for various states from the 2020 Census. It focuses on racial and ethnic categories among adults age 18+.
+
+### Exploring Variables
+
+```{r decennial-census-variable-search}
+#### Check variable names (correct programs)
+vars_2020 <- tidycensus::load_variables(2020, "pl",  cache = TRUE) 
+vars_2010 <- tidycensus::load_variables(2010, "sf1", cache = TRUE) 
+vars_2000 <- tidycensus::load_variables(2000, "sf1", cache = TRUE)
+
+# quick peek
+dplyr::glimpse(vars_2020)
+dplyr::glimpse(vars_2010)
+dplyr::glimpse(vars_2000)
+```
+
+
+### Decennial Census Data (2020)
+
+```{r decennial-census-block-group-download, message=FALSE, warning=FALSE}
+
+# Define the states of interest and the variables to query
+states <- c("IL", "IN", "OH", "KY", "WV", "PA", "TN")  # Target states
+sdiv   <- function(num, den) ifelse(den > 0, num/den, NA_real_)
+
+# Variables for the 2020 Decennial Census
+variables_2020 <- c(
+  adult18_total = "P4_001N",  # Total 18+
+  adult18_hisp  = "P4_002N",  # Hispanic (any race) 18+
+  adult18_nhw   = "P4_005N",  # Not Hispanic: White alone 18+
+  adult18_nhb   = "P4_006N"   # Not Hispanic: Black alone 18+
+)
+
+CENSUS_2020_bg <- purrr::map_dfr(states, ~ get_decennial(
+  geography     = "block group",
+  year          = 2020,
+  sumfile       = "pl",
+  state         = .x,
+  variables     = variables_2020,
+  geometry      = TRUE,
+  keep_geo_vars = TRUE,
+  output        = "wide"
+)) %>%
+  janitor::clean_names() %>%
+  sf::st_make_valid() %>%
+  dplyr::filter(!sf::st_is_empty(geometry)) %>%
+  sf::st_transform(4326) %>%
+  dplyr::mutate(
+    percent_hispanic_18plus         = sdiv(adult18_hisp, adult18_total),
+    percent_nonhisp_white_18plus    = sdiv(adult18_nhw,  adult18_total),
+    percent_nonhisp_black_18plus    = sdiv(adult18_nhb,  adult18_total)
+  )  
+
+# quick peek
+CENSUS_2020_bg %>% st_drop_geometry() %>% head()
+```
+
+
+```{r decennial-census-block-group-mapping}
+
+theme_du_bois <- function() {
+  theme_minimal(base_family = "sans", base_size = 12) %+replace%
+    theme(
+      # warm off‐white paper tone
+      plot.background   = element_rect(fill = NA, colour = NA),
+      panel.background  = element_rect(fill = NA, colour = NA),
+      # subtle dotted grid reminiscent of period illustrations
+      panel.grid.major  = element_line(colour = "grey80", linetype = "dotted", size = 0.3),
+      panel.grid.minor  = element_blank(),
+      # a thin “frame” around the map
+      panel.border      = element_rect(colour = "grey60", fill = NA, size = 0.6),
+      # remove axes
+      axis.text         = element_blank(),
+      axis.ticks        = element_blank(),
+      axis.title        = element_blank(),
+      # titles in sturdy sans
+      plot.title        = element_text(
+        family = "sans", face = "bold", size = 24,
+        hjust = 0.5, margin = margin(b = 10)
+      ),
+      plot.subtitle     = element_text(
+        family = "sans", face = "italic", size = 16,
+        hjust = 0.5, margin = margin(b = 15)
+      ),
+      # small sans caption, centered
+      plot.caption      = element_text(
+        family = "sans", size = 9, hjust = 0.5,
+        margin = margin(t = 10)
+      ),
+      # legend at bottom, with clear keys
+      legend.position   = "bottom",
+      legend.title      = element_text(family = "sans", face = "bold", size = 11),
+      legend.text       = element_text(family = "sans", size = 9),
+      legend.key        = element_rect(fill = NA, colour = NA),
+      legend.background = element_rect(fill = "transparent", colour = NA),
+      # generous plot margins
+      plot.margin       = margin(20, 20, 20, 20)
+    )
+}
+
+# Use the same 0–1 percent scale but relabel legend for 18+
+scale_pct_18plus <- function() {
+  ggplot2::scale_fill_viridis_c(
+    limits   = c(0, 1),
+    oob      = scales::squish,
+    labels   = scales::percent_format(accuracy = 1),
+    na.value = "grey85",
+    name     = "Percent of adults (18+)"
+  )
+}
+
+# Common bounding box (regionwide view)
+bb <- sf::st_bbox(CENSUS_2020_bg)
+
+# --- Map 1: Hispanic or Latino, age 18+ (any race) ---
+p_hisp18 <- ggplot2::ggplot(CENSUS_2020_bg) +
+  ggplot2::geom_sf(ggplot2::aes(fill = percent_hispanic_18plus), color = NA) +
+  scale_pct_18plus() +
+  ggplot2::coord_sf(
+    xlim = c(bb["xmin"], bb["xmax"]),
+    ylim = c(bb["ymin"], bb["ymax"]),
+    expand = FALSE
+  ) +
+  ggplot2::labs(
+    title    = "Hispanic or Latino, age 18+",
+    subtitle = "Block groups, selected states — 2020 Census",
+    caption  = "Source: U.S. Census Bureau 2020 Decennial Census via tidycensus; TIGER/Line geometries"
+  ) +
+  theme_du_bois()
+print(p_hisp18)
+ggplot2::ggsave(
+  filename = here::here(out_dir, "CENSUS_2020_percent_hispanic.png"),
+  plot = p_hisp18, width = 10, height = 8, dpi = 600
+)
+
+# --- Map 2: Non-Hispanic White alone, age 18+ ---
+p_nhw18 <- ggplot2::ggplot(CENSUS_2020_bg) +
+  ggplot2::geom_sf(ggplot2::aes(fill = percent_nonhisp_white_18plus), color = NA) +
+  scale_pct_18plus() +
+  ggplot2::coord_sf(
+    xlim = c(bb["xmin"], bb["xmax"]),
+    ylim = c(bb["ymin"], bb["ymax"]),
+    expand = FALSE
+  ) +
+  ggplot2::labs(
+    title    = "Non-Hispanic White alone, age 18+",
+    subtitle = "Block groups, selected states — 2020 Census",
+    caption  = "Source: U.S. Census Bureau 2020 Decennial Census via tidycensus; TIGER/Line geometries"
+  ) +
+  theme_du_bois()
+print(p_nhw18)
+ggplot2::ggsave(
+  filename = here::here(out_dir, "CENSUS_2020_percent_nonhisp_white.png"),
+  plot = p_nhw18, width = 10, height = 8, dpi = 600
+)
+
+# --- Map 3: Non-Hispanic Black alone, age 18+ ---
+p_nhb18 <- ggplot2::ggplot(CENSUS_2020_bg) +
+  ggplot2::geom_sf(ggplot2::aes(fill = percent_nonhisp_black_18plus), color = NA) +
+  scale_pct_18plus() +
+  ggplot2::coord_sf(
+    xlim = c(bb["xmin"], bb["xmax"]),
+    ylim = c(bb["ymin"], bb["ymax"]),
+    expand = FALSE
+  ) +
+  ggplot2::labs(
+    title    = "Non-Hispanic Black alone, age 18+",
+    subtitle = "Block groups, selected states — 2020 Census",
+    caption  = "Source: U.S. Census Bureau 2020 Decennial Census via tidycensus; TIGER/Line geometries"
+  ) +
+  theme_du_bois()
+print(p_nhb18)
+ggplot2::ggsave(
+  filename = here::here(out_dir, "CENSUS_2020_percent_nonhisp_black.png"),
+  plot = p_nhb18, width = 10, height = 8, dpi = 600
+)
+```
+
+
+# Citations 
+
+Walker, K., & Tufford, L. (2017). tidycensus: An R package for downloading and processing U.S. Census data. Journal of Statistical Software, 83(7), 1–11. https://doi.org/10.18637/jss.v083.i07
+
+U.S. Census Bureau. (2020). American Community Survey (ACS). U.S. Census Bureau. Retrieved from https://www.census.gov/programs-surveys/acs/
+
+U.S. Census Bureau. (2020). Decennial Census - PL94-171 Summary File. U.S. Census Bureau. Retrieved from https://www.census.gov/data/tables/time-series/demo/popest/2020s-counties.html
+

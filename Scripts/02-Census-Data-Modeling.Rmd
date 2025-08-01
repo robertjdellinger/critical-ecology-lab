@@ -1,0 +1,1749 @@
+---
+title: "**Modelling Census Data**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+header-includes:
+  - |
+    <style>
+      pre, code { font-size: 0.9em; line-height: 1.3; }
+    </style>
+---
+
+# Load Libraries
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+
+# ensure pacman is installed, then load/install needed packages
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+
+
+pacman::p_load(
+ tidyverse, segregation, tigris, sf, mapboxapi,
+  patchwork, scales, flextable, units, corrr, car, spdep, spatialreg,
+  GWmodel, cluster, factoextra, plotly, tmap, tidycensus
+)
+
+# tigris & sf configuration
+options(
+  tigris_use_cache = TRUE,
+  tigris_class = "sf",
+  readr.show_col_types = FALSE
+)
+sf::sf_use_s2(TRUE)
+
+# API key checks
+if (Sys.getenv("CENSUS_API_KEY") == "") {
+  message("No CENSUS_API_KEY found. Set it with tidycensus::census_api_key('YOUR_KEY', install = TRUE) and restart.")
+}
+mb_token <- Sys.getenv("MAPBOX_API_TOKEN")
+if (nzchar(mb_token)) {
+  mapboxapi::mb_access_token(mb_token, install = FALSE)
+}
+```
+
+This document shows how to use and download US Census data to research
+the underlying drivers of emissions output from industrial facilities
+across seven states identified as primary contributors to acid
+rain-related changes at the Hubbard Brook Experimental Forest (HBEF).
+The aim is to investigate if there is a relationship between wealth
+inequality and emissions output from these facilities. Census data
+provides important demographic and economic context, which helps to
+explore patterns of industrial emissions and their potential connections
+with socio-economic variables, such as wealth inequality, across
+regions.
+
+The analysis in this document introduces a series of frameworks that
+leverage Census data. This section looks at segregation and diversity
+indices, which help to understand demographic patterns that may
+correlate with the distribution of industrial emissions.
+
+# Indices of Segregation and Diversity
+
+A large body of research in the social sciences is concerned with
+neighborhood segregation and diversity. Segregation generally refers to
+the extent to which two or more groups live apart from each other;
+diversity measures neighborhood heterogeneity among groups. A wide range
+of indices have been developed by social scientists to measure
+segregation and diversity, often relying on spatial Census data.
+Segregation and diversity indices are implemented in a variety of R
+packages; the package recommended by this document is the `segregation`
+package (`Elbers 2021`), which includes R functions for various regional
+and local indices
+
+## Data Retrieval
+
+The data setup below uses spatial methods to acquire Census tract-level
+data on population estimates for non-Hispanic white, non-Hispanic black,
+non-Hispanic Asian, and Hispanic populations across the seven states
+identified as major contributors to acid rain at HBEF: Ohio,
+Pennsylvania, Tennessee, West Virginia, Kentucky, Indiana, and Illinois.
+The analysis filters Census tracts that intersect the largest urbanized
+areas by population in each state using an inner spatial join. This
+prelminary data exploration uses urbanized areas for 2019 and data from
+the 2015-2019 ACS. To extend this analysis to multiple states, a vector
+of state abbreviations is used, iterating over them to append the data
+for each state.
+
+```{r data_setup, message=FALSE, warning=FALSE, echo=TRUE, results = "hide"}
+
+# Define the states for analysis
+states <- c("OH", "PA", "TN", "WV", "KY", "IN", "IL")
+
+# Initialize an empty list to store data for each state
+state_data_list <- list()
+
+# Loop through each state to get tract data by race/ethnicity
+for (state in states) {
+  state_data <- get_acs(
+    geography = "tract",
+    variables = c(
+      white = "B03002_003",
+      black = "B03002_004",
+      asian = "B03002_006",
+      hispanic = "B03002_012"
+    ),
+    state = state,
+    geometry = TRUE,
+    year = 2019
+  )
+  state_data_list[[state]] <- state_data
+}
+
+# Combine data from all states
+acs_data <- bind_rows(state_data_list)
+
+# Use tidycensus to get urbanized areas by population with geometry, 
+# then filter for those that have populations of 100,000 or more
+us_urban_areas <- get_acs(
+  geography = "urban area",
+  variables = "B01001_001",
+  geometry = TRUE,
+  year = 2019,
+  survey = "acs1"
+) %>%
+  filter(estimate >= 100000) %>%
+  transmute(urban_name = str_remove(NAME, 
+                                    fixed(" Urbanized Area (2010)")))
+
+# Compute an inner spatial join between tract data and urbanized areas
+urban_data <- acs_data %>%
+  st_join(us_urban_areas, left = FALSE) %>%
+  select(-NAME) %>%
+  st_drop_geometry() %>% 
+  mutate(dataset = "2015-2019 5-year ACS")
+
+
+# Get tracts for each state and bind them into a single dataset
+tracts_data <- bind_rows(
+  tracts(state = "WV", cb = TRUE, year = 2019),
+  tracts(state = "PA", cb = TRUE, year = 2019),
+  tracts(state = "OH", cb = TRUE, year = 2019),
+  tracts(state = "TN", cb = TRUE, year = 2019),
+  tracts(state = "KY", cb = TRUE, year = 2019),
+  tracts(state = "IN", cb = TRUE, year = 2019),
+  tracts(state = "IL", cb = TRUE, year = 2019)
+) %>%
+  mutate(State = case_when(
+    STATEFP == "54" ~ "WV",
+    STATEFP == "42" ~ "PA",
+    STATEFP == "39" ~ "OH",
+    STATEFP == "47" ~ "TN",
+    STATEFP == "21" ~ "KY",
+    STATEFP == "18" ~ "IN",
+    STATEFP == "17" ~ "IL"
+  ))
+
+# Display the first few rows using flextable
+flextable(urban_data %>% head(10) %>%
+  dplyr::select(-dataset)) %>%
+  set_caption("Census Tract-Level Data (Urbanized Areas), 5-year ACS") %>%
+  autofit() %>%
+  colformat_num(j = c("estimate", "moe"), digits = 2) %>%  # Format numerical columns
+  set_header_labels(
+    GEOID = "Census Tract GEOID",
+    variable = "Population Group",
+    estimate = "Population Estimate",
+    moe = "Margin of Error",
+    urban_name = "Urban Area"
+  )
+```
+
+The spatial analysis workflow uses the following steps: 1. Data on race
+and ethnicity from the 2015-2019 ACS for the largest demographic groups
+is acquired at the Census tract level for multiple states. 2. Urban
+areas for the entire US are obtained, filtered to those with populations
+of 750,000 or greater. 3. A spatial join between the Census tract data
+and urban area data is computed, retaining only those Census tracts
+intersecting the urban area boundaries.
+
+## Dissimilarity Index
+
+The dissimilarity index is widely used to assess neighborhood
+segregation between two groups within a region. It ranges from 0
+(perfect integration) to 1 (complete segregation). The dissimilarity
+index ($D$) is calculated as follows:
+
+The dissimilarity index ($D$) is calculated as follows:
+
+$$
+D = \frac{1}{2} \sum_{i=1}^{N} \left| \frac{a_i}{A} - \frac{b_i}{B} \right|
+$$
+
+Where: - $a_i$ represents the population of group A in a given unit
+$i$ - $A$ is the total population of group A in the region - $b_i$
+represents the population of group B in a given unit $i$ - $B$ is the
+total population of group B in the region
+
+The dissimilarity index can be computed using the `dissimilarity()`
+function from the `segregation` package.
+
+```{r}
+# Compute dissimilarity index between Black and white populations
+dissimilarity_index_data_black_white <- urban_data %>%
+  filter(variable %in% c("white", "black")) %>%
+  group_by(urban_name) %>%
+  group_modify(~
+    dissimilarity(.x,
+      group = "variable",
+      unit = "GEOID",
+      weight = "estimate"
+    )
+  ) %>% 
+  arrange(desc(est))
+
+# Present results in a table
+flextable(dissimilarity_index_data_black_white) %>%
+  set_caption("Dissimilarity Index between Black and White Populations") %>%
+  colformat_num(j = c("est"), digits = 3) %>%
+  set_header_labels(
+    urban_name = "Urban Area",
+    stat = "Statistic",
+    est = "Dissimilarity Index Estimate"
+  ) %>%
+  autofit()
+
+# Compute dissimilarity index between non-Hispanic white and Hispanic populations
+dissimilarity_index_data_hispanic_white <- urban_data %>%
+  filter(variable %in% c("white", "hispanic")) %>%
+  group_by(urban_name) %>%
+  group_modify(~
+    dissimilarity(.x,
+      group = "variable",
+      unit = "GEOID",
+      weight = "estimate"
+    )
+  ) %>% 
+  arrange(desc(est))
+
+print(dissimilarity_index_data_hispanic_white)
+
+# Present results in a table
+flextable(dissimilarity_index_data_hispanic_white) %>%
+  set_caption("Dissimilarity Index between Hispanic and White Populations") %>%
+  colformat_num(j = c("est"), digits = 3) %>%
+  set_header_labels(
+    urban_name = "Urban Area",
+    stat = "Statistic",
+    est = "Dissimilarity Index Estimate"
+  ) %>%
+  autofit()
+```
+
+One disadvantage of the dissimilarity index is that it only measures
+segregation between two groups, the above code shows the dissimilarity
+index between white and Hispanic and white and Black populations in the
+identified states.
+
+## Multi-Group Segregation Indices
+
+Computing multi-group indices is achieved using the `segregation`
+package. To measure segregation and diversity across multiple groups, we
+use the `mutual_within()` function computes indices like the Mutual
+Information Index (M) and Theil’s Entropy Index (H).
+
+The Mutual Information Index ($M$) is computed as follows (Elbers,
+2021):
+
+$$
+M(T) = \sum_{u=1}^{U} \sum_{g=1}^{G} p_{ug} \log \frac{p_{ug}}{p_u p_g}
+$$
+
+Where: - $U$ is the total number of units - $G$ is the total number of
+groups - $p_{ug}$ is the joint probability of being in unit $u$ and
+group $g$
+
+Theil’s Entropy Index ($H$) is calculated as (Mora and Ruiz-Castillo,
+2011):
+
+$$
+H(T) = \frac{M(T)}{E(T)}
+$$
+
+Where $E(T)$ is the entropy of the dataset, normalizing $H$ to range
+between values of 0 and 1.
+
+```{r}
+# Compute multi-group segregation indices
+multigroup_indices <- mutual_within(
+  data = urban_data,
+  group = "variable",
+  unit = "GEOID",
+  weight = "estimate",
+  within = "urban_name",
+  wide = TRUE
+)
+
+# present the results in a table
+flextable(multigroup_indices %>% head(15))  %>%
+  set_caption("Multi-Group Segregation Indices by Urban Area") %>%
+  colformat_num(j = c("M", "p", "H", "ent_ratio"), digits = 3) %>%
+  set_header_labels(
+    urban_name = "Urban Area",
+    M = "Mutual Information (M)",
+    p = "Proportion (p)",
+    H = "Entropy (H)",
+    ent_ratio = "Entropy Ratio"
+  ) %>%
+  autofit()
+```
+
+## Localized Segregation Indices
+
+```{r}
+# Calculate local segregation indices
+local_segregation_indices <- urban_data %>%
+  mutual_local(
+    group = "variable",
+    unit = "GEOID",
+    weight = "estimate", 
+    wide = TRUE
+  )
+
+# Present local segregation indices
+flextable(local_segregation_indices) %>%
+  set_caption("Local Segregation Indices by Census Tract") %>%
+  colformat_num(j = c("ls", "p"), digits = 5) %>%
+  set_header_labels(
+    GEOID = "Census Tract GEOID",
+    ls = "Local Segregation Index (ls)",
+    p = "Proportion (p)"
+  ) %>%
+  autofit()
+    
+# Join Census tract data with local segregation indices on GEOID
+tracts_segregation_indices <- tracts_data %>%
+  # Make sure both GEOID columns are of the same type
+  mutate(GEOID = as.character(GEOID)) %>%
+  inner_join(local_segregation_indices %>% mutate(GEOID = as.character(GEOID)), by = "GEOID")
+
+# Function to generate segregation plot for a given state
+plot_segregation <- function(state_code, tracts_data) {
+  tracts_segregation_indices %>%
+    filter(State == state_code) %>%
+    ggplot(aes(fill = ls)) + 
+    geom_sf(color = "white", linewidth = 0.05) +  # Add tract boundaries for better clarity
+    # NAD83 / Conus Albers (EPSG:5070) projection for better accuracy in the U.S.
+    coord_sf(crs = 5070) +
+    # Use viridis color scale for better perceptual uniformity
+    scale_fill_viridis_c(
+  option = "inferno", 
+  name = "Segregation Index", 
+  limits = c(0, 2),  # Adjust based on data range
+  breaks = c(0.5, 1, 1.5, 2)) +
+    theme_minimal() +  # Cleaner theme
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14),  # Center the title
+      axis.text =  element_text(size = 5),  # Remove axis text
+      legend.position = "right",  # Move the legend to the side
+      legend.title = element_text(size = 10),  # Adjust legend title
+      legend.text = element_text(size = 8),    # Adjust legend text size
+      plot.margin = margin(10, 10, 10, 10)     # Add margins to avoid plot overlap
+    ) +
+    labs(
+      fill = "Local\nSegregation Index",  # Label for the legend
+      title = paste("Local Segregation Index for", state_code),  # Dynamic plot title
+      caption = "Data Source: US Census Data"
+    )
+}
+
+# List of state codes to plot
+states_to_plot <- c("OH", "PA", "TN", "WV", "KY", "IN", "IL")
+
+# Generate and print the segregation plots for each state using map from purrr
+segregation_plots <- purrr::map(states_to_plot, ~plot_segregation(.x, tracts_segregation_indices))
+
+# Optionally, print the plots
+purrr::walk(segregation_plots, print)
+
+```
+
+## Diversity Gradients
+
+The diversity gradient concept uses scatterplot smoothing to illustrate
+how neighborhood diversity changes with distance or travel time from the
+core of an urban region (K. Walker 2016b). Traditionally, social science
+literature on suburbanization suggests that urban cores are more diverse
+compared to the more segregated and homogeneous suburban neighborhoods.
+The diversity gradient serves as a visual tool to assess whether this
+demographic model holds true.
+
+The entropy index for a given geographic unit is calculated as follows:
+
+$$
+E = \sum_{r=1}^{n} Q_r \log \frac{1}{Q_r}
+$$
+
+Where $Q_r$ represents group $r$'s proportion of the population in the
+geographic unit.
+
+This statistic can be calculated using the `entropy()` function from the
+`segregation` package. Since the `entropy()` function computes the
+statistic for one unit at a time, we group the data by tract and use
+`group_modify()` to calculate entropy for each tract individually. The
+argument `base = 4` represents the number of groups considered, setting
+the maximum entropy value to 1, which indicates perfect evenness across
+the four groups.
+
+```{r Diversity Gradients, message=FALSE, warning=FALSE, echo=TRUE}
+
+# Define the states for analysis
+states <- c("OH", "PA", "TN", "WV", "KY", "IN", "IL")
+
+# Initialize an empty list to store data for each state
+state_data_list <- vector("list", length(states))
+names(state_data_list) <- states
+
+# Loop through each state to get tract data by race/ethnicity
+state_data_list <- lapply(states, function(state) {
+  get_acs(
+    geography = "tract",
+    variables = c(
+      white = "B03002_003",
+      black = "B03002_004",
+      asian = "B03002_006",
+      hispanic = "B03002_012"
+    ),
+    state = state,
+    geometry = TRUE,
+    year = 2019
+  )
+})
+
+# Combine data from all states
+acs_data <- bind_rows(state_data_list)
+
+# Get urbanized areas by population with geometry, filter for populations ≥ 750,000
+us_urban_areas <- get_acs(
+  geography = "urban area",
+  variables = "B01001_001",
+  geometry = TRUE,
+  year = 2019,
+  survey = "acs1"
+) %>%
+  filter(estimate >= 750000) %>%
+  transmute(urban_name = str_remove(NAME, fixed(" Urbanized Area (2010)")))
+
+# Ensure the CRS is consistent between urban areas and tracts
+us_urban_areas <- st_transform(us_urban_areas, crs = st_crs(acs_data))
+
+# Compute an inner spatial join between tract data and urbanized areas
+urban_data <- acs_data %>%
+  st_join(us_urban_areas, left = FALSE) %>%
+  select(-NAME) %>%
+  st_drop_geometry() %>%
+  mutate(dataset = "2015-2019 5-year ACS")
+
+# Function to calculate entropy and plot diversity gradient for a given urban area
+analyze_entropy <- function(urban_area_name) {
+  # Calculate entropy for each tract in the urban area
+  urban_entropy <- urban_data %>%
+    filter(urban_name == urban_area_name) %>%
+    group_by(GEOID) %>%
+    group_modify(~ data.frame(entropy = entropy(
+      data = .x,
+      group = "variable",
+      weight = "estimate",
+      base = 4)))
+  
+  # Get tract geometry and join with entropy data
+  urban_entropy_geo <- tracts(state = unique(urban_data$state), cb = TRUE, year = 2019) %>%
+    inner_join(urban_entropy, by = "GEOID")
+  
+  # Calculate the centroid of each tract
+  urban_entropy_geo <- urban_entropy_geo %>%
+    mutate(centroid = st_centroid(geometry))
+  
+  # Calculate the centroid of the urban area
+  urban_centroid <- us_urban_areas %>%
+    filter(urban_name == urban_area_name) %>%
+    st_centroid() %>%
+    st_geometry()
+  
+  # Ensure urban_centroid is of the same length as the number of tracts
+  urban_centroid <- rep(urban_centroid, nrow(urban_entropy_geo))
+  
+  # Calculate distance to urban core centroid using tract centroids
+  urban_entropy_geo <- urban_entropy_geo %>%
+    mutate(distance_to_core = as.numeric(st_distance(centroid, urban_centroid, by_element = TRUE)))
+  
+# Plot diversity gradient with enhanced visualization
+ggplot(urban_entropy_geo %>% na.omit(), aes(x = distance_to_core, y = entropy)) + 
+  geom_point(alpha = 0.6, color = "dodgerblue", size = 3) + 
+  geom_smooth(method = "loess", level = 0.95, color = "darkred", linetype = "dashed", fill = "lightpink") + 
+  theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 14),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_blank()
+  ) + 
+  labs(title = paste("Diversity Gradient in", urban_area_name, "(Urbanized Area)"),
+       x = "Distance to Urban Core (meters)",
+       y = "Entropy Index") +
+  geom_rug(sides = "b", color = "darkgrey") 
+}
+
+# Analyze and plot diversity gradients for major urban areas
+urban_areas_to_analyze <- urban_data$urban_name %>% unique()
+
+lapply(urban_areas_to_analyze, analyze_entropy)
+
+```
+
+# Regression Modeling with US Census Data
+
+In this analysis, we will be working with US Census data to model
+regression for variables of interest such as median home value, median
+income, and several demographic factors. The data is pulled from the
+American Community Survey (ACS) and visualized through maps and
+histograms. In this section, we will focus on regression modeling for
+the state of Pennsylvania (PA). The data is sourced from the 2020 ACS
+5-year estimates. We will visualize the data using geographic maps and
+histograms of median home values.
+
+## Data Retrieval
+
+```{r}
+
+# Get all names for Pennsylvania counties
+dfw_counties <- fips_codes %>%
+    filter(state == "PA") %>%
+    pull(county)
+
+# Define the variables to retrieve from the ACS
+variables_to_get <- c(
+  median_value = "B25077_001",
+  median_rooms = "B25018_001",
+  median_income = "DP03_0062",
+  total_population = "B01003_001",
+  median_age = "B01002_001",
+  pct_college = "DP02_0068P",
+  pct_foreign_born = "DP02_0094P",
+  pct_white = "DP05_0077P",
+  median_year_built = "B25037_001",
+  percent_ooh = "DP04_0046P"
+)
+
+# Get ACS data for Pennsylvania counties
+dfw_data <- get_acs(
+  geography = "tract",
+  variables = variables_to_get,
+  state = "PA",
+  county = dfw_counties,
+  geometry = TRUE,
+  output = "wide",
+  year = 2020
+) %>%
+  select(-NAME) 
+
+# Calculate population density and median structure age
+dfw_data_for_model <- dfw_data %>%
+  # Calculate population density in people per square kilometer
+  mutate(population_density = as.numeric(set_units(total_populationE / st_area(.), "1/km2")),
+         median_structure_age = 2018 - median_year_builtE) %>%
+  select(!ends_with("M")) %>% 
+  rename_with(.fn = ~str_remove(.x, "E$")) %>%
+  na.omit()
+
+```
+
+## Regression Modeling
+
+In this section, we are performing a **regression modeling** analysis to
+understand the factors influencing median home values in different
+census tracts. Specifically, we are using a multiple linear regression
+model where the outcome variable is the natural logarithm of median home
+value. The natural log transformation is applied to the home values to
+stabilize variance and normalize the distribution of the values, which
+is common when dealing with skewed data like home prices. Later in this
+analysis, the data for median home value will be swapped out with
+emissions data as the outcome variable to investigate factors affecting
+emissions across different state however the follwoing analysis is
+conducted as exploratory.
+
+**Regression Equation**
+
+We are modeling the log of the median home value
+($\log(\text{median\_value})$) as a function of several predictors,
+including:
+
+-   **Median number of rooms** ($\text{median\_rooms}$): Reflects the
+    typical size of homes in terms of room count.
+-   **Median household income** ($\text{median\_income}$): Represents
+    the average household income in the area.
+-   **Percentage of population with a college degree**
+    ($\text{pct\_college}$): Indicates the educational attainment of the
+    area’s population.
+-   **Percentage of foreign-born population**
+    ($\text{pct\_foreign\_born}$): Reflects the diversity of the
+    population in terms of immigrant residents.
+-   **Percentage of White (non-Hispanic) population**
+    ($\text{pct\_white}$): Reflects the racial composition of the area.
+-   **Median age of the population** ($\text{median\_age}$): Provides
+    insight into the age distribution within the census tract.
+-   **Median structure age of homes** ($\text{median\_structure\_age}$):
+    Represents the average age of housing structures, indicating whether
+    the area has older or newer homes.
+-   **Percentage of owner-occupied housing** ($\text{percent\_ooh}$):
+    Indicates the proportion of homes owned by occupants rather than
+    rented.
+-   **Population density** ($\text{pop\_density}$): Describes the number
+    of people per unit area, reflecting how crowded or spacious the
+    region is.
+-   **Total population** ($\text{total\_population}$): Reflects the
+    total number of people living in the tract.
+
+The model is represented by the following equation:
+
+$$
+\log(\text{median\_value}) = \alpha + \beta_{1}(\text{median\_rooms}) + \beta_{2}(\text{median\_income}) + \beta_{3}(\text{pct\_college}) + \beta_{4}(\text{pct\_foreign\_born}) + \beta_{5}(\text{pct\_white}) + \beta_{6}(\text{median\_age}) + \beta_{7}(\text{median\_structure\_age}) + \beta_{8}(\text{percent\_ooh}) + \beta_{9}(\text{pop\_density}) + \beta_{10}(\text{total\_population}) + \epsilon
+$$
+
+Here, $\alpha$ is the intercept, and each $\beta$ represents the
+coefficient for its respective predictor. The error term ($\epsilon$)
+captures any unexplained variation in the model.
+
+In this section, we fit two linear regression models to examine the
+relationship between the log of the median home value and various
+explanatory variables. We present the coefficients, standard errors,
+t-values, and P-values for each model, along with a Variance Inflation
+Factor (VIF) analysis to assess multicollinearity.
+
+### Model: Full Linear Model
+
+```{r message=FALSE, warning=FALSE}
+
+
+# Define the formula for the linear model
+formula <- "log(median_value) ~ median_rooms + median_income + pct_college + pct_foreign_born + pct_white + median_age + median_structure_age + percent_ooh + population_density + total_population"
+
+# Fit the linear model
+linear_model <- lm(formula = formula, data = dfw_data_for_model)
+
+# Extract the summary of the linear model
+model_summary <- summary(linear_model)
+
+# Convert model coefficients to a dataframe for presentation
+model_df <- as.data.frame(coef(model_summary))
+
+# Add meaningful column names
+colnames(model_df) <- c("Estimate", "Std. Error", "t value", "P-value")
+
+# Ensure all values are formatted to 2 decimal places including P-values
+model_df$Estimate <- round(model_df$Estimate, 3)
+model_df$`Std. Error` <- round(model_df$`Std. Error`, 3)
+model_df$`t value` <- round(model_df$`t value`, 3)
+model_df$`P-value` <- ifelse(model_df$`P-value` < 0.001, 
+                             formatC(model_df$`P-value`, format = "e", digits = 3), 
+                             round(model_df$`P-value`, 3))
+
+# Create a flextable with model summary
+model_flextable <- flextable(model_df) %>%
+  set_caption("Linear Model Summary: Coefficients and Significance") %>%
+  autofit() %>%
+  colformat_num(j = c("Estimate", "Std. Error", "t value"), digits = 3) %>%
+  colformat_double(j = "P-value", digits = 3, big.mark = "") %>%
+  set_header_labels(
+    Estimate = "Estimate",
+    `Std. Error` = "Standard Error",
+    `t value` = "t-value",
+    `P-value` = "P-value"
+  )
+
+# Display the flextable
+model_flextable
+
+dfw_estimates <- dfw_data_for_model %>%
+  select(-GEOID, -median_value, -median_year_built) %>%
+  st_drop_geometry()
+
+# Calculate correlations between variables and present. plot
+correlations <- correlate(dfw_estimates, method = "pearson")
+network_plot(correlations) 
+
+# Present the VIF table
+VIF_table <- vif(linear_model) %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%      # Convert rownames (variables) to a column
+  mutate(VIF = round(`.` , 3)) %>%        # Round the VIF values to 2 decimal places
+  select(Variable, VIF) %>%               # Ensure columns are correctly named
+  arrange(desc(VIF)) %>%                  # Sort by VIF
+  flextable() %>%
+  set_caption("Variance Inflation Factors (VIF)")
+
+VIF_table
+```
+
+A VIF value of 1 indicates no collinearity; VIF values above 5 suggest a
+level of collinearity that has a problematic influence on model
+interpretation (James et al. 2013). VIF is implemented by the `vif()`
+function in the `car` package (Fox and Weisberg 2019).
+
+### Model: Simplified Linear Model
+
+```{r message=FALSE, warning=FALSE}
+
+# Define the second formula for the linear model
+formula_2 <- "log(median_value) ~ median_rooms + pct_college + pct_foreign_born + pct_white + median_age + median_structure_age + percent_ooh + population_density + total_population"
+
+# Fit the second linear model
+linear_model_2 <- lm(formula = formula_2, data = dfw_data_for_model)
+
+# Extract the summary of the second linear model
+model_summary_2 <- summary(linear_model_2)
+
+# Convert model coefficients to a dataframe for presentation
+model_df_2 <- as.data.frame(coef(model_summary_2))
+# Add meaningful column names
+colnames(model_df_2) <- c("Estimate", "Std. Error", "t value", "P-value")
+
+# Format P-values in scientific notation where necessary and round other values to 3 digits
+model_df_2$Estimate <- round(model_df_2$Estimate, 3)
+model_df_2$`Std. Error` <- round(model_df_2$`Std. Error`, 3)
+model_df_2$`t value` <- round(model_df_2$`t value`, 3)
+model_df_2$`P-value` <- ifelse(model_df_2$`P-value` < 0.001, 
+                              formatC(model_df_2$`P-value`, format = "e", digits = 3), 
+                              round(model_df_2$`P-value`, 3))
+
+# Create a flextable with model summary
+model_flextable_2 <- flextable(model_df_2) %>%
+  set_caption("Linear Model Summary: Coefficients and Significance (Model 2)") %>%
+  autofit() %>%
+  colformat_num(j = c("Estimate", "Std. Error", "t value"), digits = 3) %>%
+  colformat_double(j = "P-value", digits = 3, big.mark = "") %>%
+  set_header_labels(
+    Estimate = "Estimate",
+    `Std. Error` = "Standard Error",
+    `t value` = "t-value",
+    `P-value` = "P-value"
+  )
+
+# Display the flextable
+model_flextable_2
+
+# Present the VIF table for the second model
+VIF_table_2 <- vif(linear_model_2) %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%      # Convert rownames (variables) to a column
+  mutate(VIF = round(`.` , 2)) %>%        # Round the VIF values to 2 decimal places
+  select(Variable, VIF) %>%               # Ensure columns are correctly named
+  arrange(desc(VIF)) %>%                  # Sort by VIF
+  flextable() %>%
+  set_caption("Variance Inflation Factors (VIF) for Model 2")
+
+# Display the VIF table
+VIF_table_2
+```
+
+## Principle Component Analysis
+
+Principal Component Analysis (PCA) was conducted on the standardized
+data to reduce dimensionality and explore the relationships among the
+variables. The PCA summary includes the explained variance of each
+principal component, formatted into a table. The PCA loadings, which
+indicate the contribution of each variable to the principal components,
+were also retrieved. A bar plot of the PCA loadings was created to
+visualize the relationships between variables and principal components.
+
+```{r}
+# Performing Principal Component Analysis on the standardized data
+pca <- prcomp(formula = ~., data = dfw_estimates, scale. = TRUE, center = TRUE)
+
+# Summarizing PCA results
+pca_summary <- summary(pca)
+
+# Formatting PCA results into a table for presentation
+pca_table <- pca_summary$importance %>%
+  as.data.frame() %>%
+  rownames_to_column("Metric") %>%
+  mutate(Metric = ifelse(Metric == "Comp. 1", "PC1", "PC2")) %>%
+  # Rounding only numeric columns to 2 decimal places
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  select(Metric, everything()) %>%
+  flextable() %>%
+  set_caption("PCA Summary for US Census Data: Explained Variance and Cumulative Proportion")
+
+pca_table
+
+# Retrieving and formatting PCA loadings
+pca_loadings_table <- pca$rotation %>%
+  as_tibble(rownames = "predictor") %>%
+  mutate(across(where(is.numeric), ~round(., 2))) 
+
+# Displaying PCA loadings
+pca_loadings_table %>%
+  flextable() %>%
+  set_caption("PCA Loadings for US Census Data")
+
+# Plot the PCA loadings
+pca_plot <- pca_loadings_table %>%
+  dplyr::select(predictor:PC5) %>% 
+  pivot_longer(PC1:PC5, names_to = "component", values_to = "value") %>%
+  ggplot(aes(x = value, y = predictor)) + 
+  geom_col(fill = "darkolivegreen4", color = "darkolivegreen4", alpha = 0.5) + 
+  facet_wrap(~component, nrow = 1) + 
+  labs(y = "Variable", x = "Value", title = "US Census Data PCA Loadings Barplot (5-Year ACS, 2015-2019)") +
+  theme_minimal() + 
+  theme(axis.text.y = element_text(size = 8),
+        axis.text.x = element_text(size = 5),
+        axis.title = element_text(size = 10),
+        strip.text = element_text(size = 10),
+        plot.title = element_text(size = 12, hjust = 0.5)
+        )
+
+print(pca_plot)
+```
+
+## Visualizing PCA Components
+
+The PCA component scores for each observation were calculated and
+combined with the original GEOID and median home value data. A spatial
+visualization of the first principal component (PC1) across regions was
+created to explore spatial patterns in the data. A linear model was then
+fit using the principal components as predictors to understand the
+relationship between the principal components and median home values.
+The results of the PCA-based regression model, including coefficients,
+standard errors, t-values, and p-values, are presented in the table
+below.
+
+```{r}
+# Get PCA component scores for each observation
+components <- predict(pca, dfw_estimates)
+
+# Create a new dataframe combining the original GEOID and median_value with PCA components
+dfw_pca <- dfw_data_for_model %>%
+  select(GEOID, median_value) %>%
+  cbind(components)
+
+# Visualize the first principal component (PC1) across regions
+ggplot(dfw_pca, aes(fill = PC1)) +
+  geom_sf(color = NA) +
+  theme_void() +
+  scale_fill_viridis_c() +
+  labs(title = "Spatial Visualization of Principal Component 1 (PC1)")
+
+# Construct a formula for regression using PC1 to PC6 as predictors
+pca_formula <- paste0("log(median_value) ~ ", paste0('PC', 1:6, collapse = ' + '))
+
+# Fit a linear model using the principal components as predictors
+pca_model <- lm(formula = pca_formula, data = dfw_pca)
+
+# Get a summary of the PCA-based regression model
+pca_summary <- summary(pca_model)
+
+# Convert model coefficients to a dataframe for presentation
+pca_model_df <- broom::tidy(pca_model) %>%
+  mutate(
+    estimate = round(estimate, 2),
+    std.error = round(std.error, 2),
+    statistic = round(statistic, 2),
+    p.value = ifelse(p.value < 0.001, format(p.value, scientific = TRUE), round(p.value, 3))
+  )
+
+# Create a flextable to present the PCA regression results
+pca_model_flextable <- flextable(pca_model_df) %>%
+  set_caption("PCA-Based Regression Model Summary: Coefficients and Significance") %>%
+  autofit() %>%
+  colformat_num(j = c("estimate", "std.error", "statistic"), digits = 2) %>%
+  colformat_double(j = "p.value", digits = 2, big.mark = "") %>%
+  set_header_labels(
+    term = "Predictor",
+    estimate = "Estimate",
+    std.error = "Standard Error",
+    statistic = "t-value",
+    p.value = "P-value"
+  )
+
+# Display the flextable
+pca_model_flextable
+
+```
+
+## Spatial Regression
+
+Spatial autocorrelation is an important diagnostic when dealing with
+geographical data. If residuals from a regression model are spatially
+autocorrelated, the assumption of independent errors in linear
+regression is violated, potentially leading to biased estimates and
+incorrect inferences. Moran’s I is commonly used to detect spatial
+autocorrelation in residuals. If the test shows significant spatial
+autocorrelation, this suggests that spatial models (such as spatial lag
+or error models) may be more appropriate than standard OLS models
+(Anselin 1988).
+
+In this analysis, we check for spatial autocorrelation in the residuals
+of a simplified linear model using Moran's I. We also visualize the
+distribution of residuals and their spatial lagged values to further
+explore spatial patterns.
+
+```{r}
+
+# Add residuals to the dataset from the simplified linear model
+dfw_data_for_model$residuals <- residuals(linear_model_2)
+
+# Plot histogram of residuals to check their distribution
+residuals_histogram <- ggplot(dfw_data_for_model, aes(x = residuals)) + 
+  geom_histogram(bins = 100, alpha = 0.7, fill = "darkblue", color = "darkblue") + 
+  theme_minimal() +
+  labs(title = "Histogram of Residuals", x = "Residuals", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Create spatial weights for neighbors
+wts <- dfw_data_for_model %>%
+  poly2nb() %>%
+  nb2listw()
+
+# Conduct Moran's I test for spatial autocorrelation
+moran_test <- moran.test(dfw_data_for_model$residuals, wts)
+
+# Add lagged residuals for spatial lag model visualization
+dfw_data_for_model$lagged_residuals <- lag.listw(wts, dfw_data_for_model$residuals)
+
+# Plot residuals vs lagged residuals to visualize spatial dependence
+residuals_vs_lagged <- ggplot(dfw_data_for_model, aes(x = residuals, y = lagged_residuals)) + 
+  theme_minimal() + 
+  geom_point(alpha = 0.6, color = "royalblue3") + 
+  geom_smooth(method = "lm", color = "darkblue", se = FALSE) +
+  labs(title = "Residuals vs Lagged Residuals", x = "Residuals", y = "Lagged Residuals") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Display the plots
+print(residuals_histogram)
+print(residuals_vs_lagged)
+
+# Moran's I Test Results formatted as a table
+moran_test_flextable <- as.data.frame(t(unclass(moran_test$estimate))) %>%
+  setNames(c("Observed Moran's I", "Expected Moran's I", "Variance")) %>%
+  rownames_to_column("Metric") %>%
+  flextable() %>%
+  set_caption("Moran's I Test for Spatial Autocorrelation in Residuals")
+
+# Display Moran's I Test Results
+moran_test_flextable
+```
+
+In the following section, spatial regression techniques that account for
+spatial dependence in the data are run. Two primary types of spatial
+models—spatial lag models and spatial error models—are used to account
+for spatial autocorrelation.
+
+-   Spatial Lag Model: This model includes a spatial lag of the outcome
+    variable in the regression, allowing us to account for the influence
+    of neighboring areas on the values in the current area. The spatial
+    lag model introduces a spatially lagged dependent variable in the
+    model's right-hand side, and special estimation methods are used to
+    avoid violating assumptions of independence.
+
+-   Spatial Error Model: In contrast to the lag model, the spatial error
+    model introduces spatial autocorrelation in the error term,
+    capturing latent spatial processes that affect the outcome but
+    aren't directly included in the predictors.
+
+### Spatial Lag Model (Spatial Autocorrelation in Predictors)
+
+The spatial lag model captures spatial dependence by including a spatial
+lag of the dependent variable (log-transformed median home value) as a
+predictor. This helps account for the possibility that neighboring
+regions influence each other. The `lagsarlm()` function from the
+`spatialreg` package is used to estimate this model.
+
+```{r Spatial Lag Model, message=FALSE, warning=FALSE}
+
+# Define the spatial lag model
+lag_model <- lagsarlm(
+  formula = formula_2, 
+  data = dfw_data_for_model, 
+  listw = wts
+)
+
+# Summarize the spatial lag model, including Nagelkerke's pseudo R-squared
+lag_model_summary <- summary(lag_model, Nagelkerke = TRUE)
+print(lag_model_summary)
+
+# Running Morans Test on the residuals
+moran.test(lag_model$residuals, wts)
+```
+
+### Spatial Error Model (Spatial Autocorrelation in Errors)
+
+The spatial error model captures spatial dependence in the error terms,
+rather than in the predictors. It is useful when spatial correlation
+affects the unexplained variation in the model. The `errorsarlm()`
+function is used to estimate this model.
+
+```{r Spatial Error Model, message=FALSE, warning=FALSE}
+
+# Define the spatial error model
+error_model <- errorsarlm(
+  formula = formula_2, 
+  data = dfw_data_for_model, 
+  listw = wts
+)
+
+# Summarize the spatial error model, including Nagelkerke's pseudo R-squared
+error_model_summary <- summary(error_model, Nagelkerke = TRUE)
+
+# Print the summary of the spatial error model
+error_model_summary
+
+# Running Morans Test on the error model 
+moran.test(error_model$residuals, wts)
+```
+
+### Spatial Dependence Test
+
+The Lagrange Multiplier (LM) tests help detect the presence of spatial
+dependence in the residuals of an ordinary least squares (OLS) model.
+These tests help determine whether spatial error or spatial lag models
+are necessary.
+
+```{r Spatial Dependence, message=FALSE, warning=FALSE}
+
+# Perform Lagrange Multiplier (LM) tests for spatial dependence in residuals
+lm_tests <- lm.LMtests(
+  model = linear_model_2,  # OLS model
+  wts, # Spatial weights
+  test = c("LMerr", "LMlag", "RLMerr", "RLMlag")  # Testing for spatial error and lag dependence
+)
+
+# Print the results of the LM tests
+lm_tests
+
+```
+
+## Geographically Weighted Regression
+
+The models addressed in the previous sections, including both the
+regular linear model and its spatial adaptations, estimate global
+relationships between the outcome variable (e.g., median home values)
+and its predictors. However, relationships between a predictor and the
+outcome variable observed for the entire region may vary significantly
+from neighborhood to neighborhood. This phenomenon is called **spatial
+non-stationarity**, and it can be explored using **Geographically
+Weighted Regression (GWR)**.
+
+Geographically Weighted Regression (GWR) is a spatial regression
+technique that allows the relationship between the dependent variable
+and independent variables to vary across space. GWR estimates local
+regression coefficients for each observation, providing insights into
+spatially varying relationships that may be masked in global regression
+models. In this analysis, we fit a GWR model to explore the spatially
+varying relationships between median home values and selected
+predictors.
+
+GWR evaluates local variations in regression models using a
+**kernel-based weighting function**. The basic form of GWR for a given
+location $i$ is:
+
+$$
+Y_i = \alpha_i + \sum\limits_{k=1}^m \beta_{ik} X_{ik} + \epsilon_i
+$$
+
+where: - $Y_i$ is the outcome at location $i$, - $\alpha_i$ is the
+location-specific intercept, - $\beta_{ik}$ is the local regression
+coefficient for predictor $k$, - $\epsilon_i$ is the error term at
+location $i$.
+
+GWR uses a **kernel bandwidth** to compute the local regression model
+for each location. This bandwidth can be either **fixed** (based on a
+distance cutoff) or **adaptive** (using nearest neighbors). In our case,
+using Census tract data where the size of tracts varies widely, an
+adaptive kernel is preferred.
+
+**Fitting and Evaluating the GWR Model**
+
+The code below shows how to fit a GWR model with a defined formula and
+plot the maps of local R-squared values. Furthermore local parameter
+estimates for the percentage of owner-occupied housing, and local
+parameter estimates for population density are also included in order to
+provide insights into the spatially varying relationships between the
+predictors and median home values.
+
+```{r Geographically Weighted Regression, message=FALSE, warning=FALSE, echo=TRUE}
+
+# Convert data to spatial format for GWmodel compatibility
+dfw_data_sp <- dfw_data_for_model %>%
+  as_Spatial()
+
+# Choose the bandwidth using cross-validation
+bw <- bw.gwr(
+  formula = formula_2, 
+  data = dfw_data_sp, 
+  kernel = "bisquare",
+  adaptive = TRUE
+)
+
+# Fit the GWR model
+gw_model <- gwr.basic(
+  formula = formula_2, 
+  data = dfw_data_sp, 
+  bw = bw,
+  kernel = "bisquare",
+  adaptive = TRUE
+)
+
+# Print the model results
+gw_model_results <- gw_model$SDF %>%
+  st_as_sf() 
+
+# Plot the GWR results
+ggplot(gw_model_results, aes(fill = Local_R2)) + 
+  geom_sf(color = NA) + 
+  scale_fill_viridis_c() + 
+  theme_void()  + 
+  labs(title = "Local R-Squared Values from the GWR Model", fill = expression("Local R"^2)) + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot the local relationships between the percentage owner-occupied housing and median home values
+ggplot(gw_model_results, aes(fill = percent_ooh)) + 
+  geom_sf(color = NA) + 
+  scale_fill_viridis_c() + 
+  theme_void() + 
+  labs(title = "Local β for the GWR Model (% Owner-Occupied Housing)",
+         fill = "Local β for \npercentage owner-occupied housing ")+ 
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Explore this further by investigating the local parameter estimates for population density
+ggplot(gw_model_results, aes(fill = population_density)) + 
+  geom_sf(color = NA) + 
+  scale_fill_viridis_c() + 
+  theme_void() + 
+  labs(title = "Local β for the GWR Model (Population Density)",
+       fill = "Local β for \npopulation density") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+## Classification and Clustering
+
+The statistical models discussed earlier were used to understand
+relationships between an outcome variable and a series of predictors. In
+the context of emissions analysis, these models are critical for
+identifying and understanding the factors contributing to environmental
+outcomes like air pollution or greenhouse gas emissions. Geodemographic
+clustering groups areas based on similarities in demographic and
+environmental factors, which can also be applied to emissions data. For
+example, regions with low emissions might cluster together, whereas
+areas with predominantly industrial emissions might form another
+cluster. Regionalization creates contiguous areas based on similarities
+in values, demographic factors, or other key indicators. This is
+particularly useful for spatial analysis, where regions with similar
+environmental/demographic trends can be grouped together. Below is an
+example using dimension reduction (principal component analysis)
+followed by k-means clustering to identify distinct geodemographic
+groups within the area of interest.
+
+### K-Means Clustering
+
+We use the k-means clustering algorithm to partition the dataset into
+distinct groups. The k-means algorithm attempts to generate `k` clusters
+that are internally similar but dissimilar from other clusters. In R,
+the k-means clustering can be implemented with the `kmeans()` function.
+Below is an example that demonstrates how we can use k-means to classify
+regions based on principal component analysis (PCA) results. This helps
+to reduce the dimensionality of the data while maintaining important
+patterns.
+
+```{r K-Means Clustering, message=FALSE, warning=FALSE, echo=TRUE}
+
+# Setting seed for reproducibility
+set.seed(123)
+
+# Calculate statistical validation of the number of clusters (gap statistic)
+#gap_stat <- clusGap(dfw_pca %>% st_drop_geometry() %>% select(PC1:PC8),
+                   # FUN = kmeans, nstart = 25, K.max = 10, B = 50)
+
+# Plot the gap statistic
+#fviz_gap_stat(gap_stat) # 7 clusters seems to be the optimal number
+
+# Perform k-means clustering on the PCA-transformed data (assume dfw_pca is created)
+dfw_kmeans <- dfw_pca %>%
+  st_drop_geometry() %>%
+  select(PC1:PC8) %>%
+  kmeans(centers = 7)
+
+# Assign the cluster IDs to the original dataset
+dfw_clusters <- dfw_pca %>%
+  mutate(cluster = as.character(dfw_kmeans$cluster))
+
+# Visualize the clusters on a map
+ggplot(dfw_clusters, aes(fill = cluster)) + 
+  geom_sf(size = 0.1) + 
+  scale_fill_brewer(palette = "Set1") + 
+  theme_void() + 
+  labs(fill = "Cluster", title = "Geodemographic Clusters (K-Means Clustering)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Visualize the clusters on a plot using ggplotly for interactivity
+cluster_plot <- ggplot(dfw_clusters, 
+                       aes(x = PC1, y = PC2, color = cluster)) + 
+  geom_point() + 
+  scale_color_brewer(palette = "Set1") + 
+  theme_minimal() 
+
+ggplotly(cluster_plot) %>%
+  layout(legend = list(orientation = "h", y = -0.15, 
+                       x = 0.2, title = "Cluster")) %>%
+  config(displayModeBar = F) %>% 
+  layout(title = "Geodemographic Clusters (K-Means Clustering)")
+
+# Create a data frame with the count of regions per cluster
+cluster_counts <- as.data.frame(table(dfw_kmeans$cluster))
+# Rename the columns for better readability
+colnames(cluster_counts) <- c("Cluster", "Number of Regions")
+# Create a flextable to display the cluster counts
+cluster_flextable <- flextable(cluster_counts) %>%
+  set_caption("Number of Regions per Cluster") %>%
+  autofit()
+
+# Display the table
+cluster_flextable
+
+
+
+```
+
+### Spatial Clustering
+
+Spatial clustering is a technique used to identify spatial patterns in
+data, grouping regions with similar characteristics together. In the
+context of emissions analysis, spatial clustering can help identify
+areas with similar emission profiles, which can be useful for targeted
+policy interventions or resource allocation. In this section, we
+demonstrate how to perform spatial clustering using the SKATER algorithm
+(Assunção et al. 2006). This algorithm is implemented in R with the
+skater() function in the `spdep` package and is also available in PySAL,
+GeoDa, and ArcGIS as the “Spatially Constrained Multivariate Clustering”
+tool.
+
+```{r Spatial Clustering, message=FALSE, warning=FALSE, echo=TRUE}
+
+# Prepare the input data for the SKATER algorithm by selecting the first 8 principal components
+input_vars <- dfw_pca %>%
+  select(PC1:PC8) %>%      # Select principal components (PC1 to PC8) from the PCA-transformed data
+  st_drop_geometry() %>%    # Remove spatial (geometry) information to focus on numerical data
+  as.data.frame()        
+
+# Create a neighborhood structure (adjacency list) using Queen contiguity (neighboring polygons share an edge)
+skater_nbrs <- poly2nb(dfw_pca, queen = TRUE)
+
+# Calculate the "costs" (differences) between neighboring polygons based on the input variables
+costs <- nbcosts(skater_nbrs, input_vars)
+
+# Create a spatial weights object using the neighbor costs, with "B" style to set binary weights
+skater_weights <- nb2listw(skater_nbrs, costs, style = "B")
+
+# Generate a minimum spanning tree (MST) from the spatial weights object
+mst <- mstree(skater_weights)
+
+# Perform the SKATER algorithm to generate 7 regional clusters (using ncuts = 7), ensuring each region has at least 10 Census tracts (crit = 10)
+#regions <- skater(
+ # mst[,1:2],  # The first two columns of the MST (the edges of the tree)
+ # input_vars, # The input data (principal components)
+ # ncuts = 5,  # Number of cuts (creates 9 regions)
+ # crit = 10   # Minimum number of tracts per region
+ # )
+
+# Assign the resulting region labels (clusters) to the original spatial data frame
+ # dfw_clusters$region <- as.character(regions$group)
+
+# Visualize the resulting regions on a map using ggplot2
+# ggplot(dfw_clusters, aes(fill = region)) + 
+ # geom_sf(size = 0.1) +       
+ # scale_fill_brewer(palette = "Set1")
+ # theme_void()                     
+
+
+```
+
+# Foor Loop for Downloading ACS Data
+
+For the purpose of this analysis, we will download the American
+Community Survey (ACS) data for selected states and years. The ACS
+provides detailed demographic, social, economic, and housing data for
+the United States, making it a valuable resource for understanding
+regional characteristics. We will focus on the following states: Ohio
+(OH), Pennsylvania (PA), Tennessee (TN), West Virginia (WV), Kentucky
+(KY), Indiana (IN), and Illinois (IL). The data will be downloaded for
+the years 2005, 2010, and 2015 to capture changes over time.
+
+## Downloading data
+
+```{r}
+
+# List of states for which to retrieve data
+states <- c("OH", "PA", "TN", "WV", "KY", "IN", "IL")
+
+# Variables to retrieve from the ACS
+variables_to_get <- c(
+  # General wealth and housing indicators
+  median_value = "B25077_001",          # Median home value
+  median_rooms = "B25018_001",          # Median number of rooms
+  median_income = "DP03_0062",          # Median household income
+  total_population = "B01003_001",      # Total population
+  median_age = "B01002_001",            # Median age
+  pct_college = "DP02_0068P",           # Percent with Bachelor's degree or higher
+  pct_foreign_born = "DP02_0094P",      # Percent foreign-born population
+  pct_white = "DP05_0077P",             # Percent White population
+  median_year_built = "B25037_001",     # Median year structure built
+  percent_ooh = "DP04_0046P",           # Percent owner-occupied housing
+
+  # Income by race
+  median_income_black = "B19013B_001",  # Median household income for Black or African American households
+  median_income_white = "B19013H_001",  # Median household income for White (non-Hispanic) households
+  median_income_hispanic = "B19013I_001",# Median household income for Hispanic or Latino households
+  median_income_asian = "B19013D_001",  # Median household income for Asian households
+  
+  # Per capita income by race
+  per_capita_income_black = "B19301B_001",  # Per capita income for Black or African American households
+  per_capita_income_white = "B19301H_001",  # Per capita income for White (non-Hispanic) households
+  per_capita_income_hispanic = "B19301I_001",# Per capita income for Hispanic or Latino households
+  per_capita_income_asian = "B19301D_001"  # Per capita income for Asian households
+
+)
+
+# Function to list all counties for a given state
+list_counties_by_state <- function(state_abbreviation) {
+  fips_codes %>%
+    filter(state == state_abbreviation) %>%
+    pull(county)
+}
+
+# Years for which to retrieve ACS data (5-year estimates)
+years <- seq(2009, 2020, by = 5)
+
+# Initialize an empty list to store the data for each state and year
+all_data <- list()
+
+# Loop through each year, then through each state, and retrieve the ACS data
+for (year in years) {
+  
+  # Initialize a list to store data for this year
+  year_data_list <- list()
+  
+  for (state in states) {
+    
+    # List all counties in the current state
+    state_counties <- list_counties_by_state(state)
+    
+    # Retrieve ACS data for the state's counties
+    state_data <- get_acs(
+      geography = "tract",
+      variables = variables_to_get,
+      state = state,
+      county = state_counties,
+      geometry = TRUE,
+      output = "wide",
+      year = year
+    ) %>%
+      select(-NAME) %>%               # Remove the NAME column
+      st_transform(crs = 5070) %>%    # NAD83 / Conus Albers projection
+      mutate(dataset = paste0(year - 4, "-", year, " 5-year ACS"),
+             state = state)           # Add a dataset and state column
+    
+    # Append the state's data for this year to the list
+    year_data_list[[state]] <- state_data
+  }
+  
+  # Combine the data for all states for this year
+  combined_year_data <- bind_rows(year_data_list)
+  
+  # Append this year's data to the master list
+  all_data[[as.character(year)]] <- combined_year_data
+}
+
+# Combine the data from all years into a single data frame
+final_combined_data <- bind_rows(all_data)
+
+# Ensure the geometry column is dropped correctly using st_drop_geometry()
+flextable(
+  final_combined_data %>%
+    st_drop_geometry() %>%               # Correctly remove the geometry column
+    head(15)                          # Select the first 15 rows
+) %>%
+  set_caption("Census Tract-Level Data (Selected Variables), 5-year ACS") %>%
+  autofit() %>%
+  colformat_num(j = c("median_valueE", "median_valueM", "median_roomsE", "median_roomsM",
+                      "median_incomeE", "median_incomeM", "total_populationE", "total_populationM",
+                      "median_ageE", "median_ageM", "median_year_builtE", "median_year_builtM",
+                      "pct_collegeE", "pct_collegeM", "pct_whiteE", "pct_whiteM",
+                      "pct_foreign_bornE", "pct_foreign_bornM", "percent_oohE", "percent_oohM"),
+                digits = 2) %>%  # Format numerical columns
+  set_header_labels(
+    GEOID = "Census Tract GEOID",
+    median_valueE = "Median Home Value Estimate",
+    median_valueM = "Median Home Value Margin of Error",
+    median_roomsE = "Median Rooms Estimate",
+    median_roomsM = "Median Rooms Margin of Error",
+    median_incomeE = "Median Income Estimate",
+    median_incomeM = "Median Income Margin of Error",
+    total_populationE = "Total Population Estimate",
+    total_populationM = "Total Population Margin of Error",
+    median_ageE = "Median Age Estimate",
+    median_ageM = "Median Age Margin of Error",
+    median_year_builtE = "Median Year Built Estimate",
+    median_year_builtM = "Median Year Built Margin of Error",
+    pct_collegeE = "Percent College-Educated Estimate",
+    pct_collegeM = "Percent College-Educated Margin of Error",
+    pct_whiteE = "Percent White Estimate",
+    pct_whiteM = "Percent White Margin of Error",
+    pct_foreign_bornE = "Percent Foreign-Born Estimate",
+    pct_foreign_bornM = "Percent Foreign-Born Margin of Error",
+    percent_oohE = "Percent Owner-Occupied Housing Estimate",
+    percent_oohM = "Percent Owner-Occupied Housing Margin of Error",
+    state = "State",
+    dataset = "Dataset"
+  )
+
+# Write out the data to a CSV file
+write_csv(final_combined_data, here::here("Output", "US_Census_Tract_Data_Population_2005_2020.csv"))
+acs_data_states_of_interest <- read_csv(here::here("Output", "US_Census_Tract_Data_Population_2005_2020.csv"))
+```
+
+## Regression Modeling Example
+
+### Multiple States, Household Value
+
+```{r Regression Modeling (Multiple States), message=FALSE, warning=FALSE, echo=TRUE}
+
+
+# List of variables to retrieve from the ACS
+variables_to_get <- c(
+  median_value = "B25077_001",
+  median_rooms = "B25018_001",
+  median_income = "DP03_0062",
+  total_population = "B01003_001",
+  median_age = "B01002_001",
+  pct_college = "DP02_0068P",
+  pct_foreign_born = "DP02_0094P",
+  pct_white = "DP05_0077P",
+  median_year_built = "B25037_001",
+  percent_ooh = "DP04_0046P"
+)
+
+# Function to create maps and histograms for a state
+create_maps_and_histograms <- function(state_abbreviation) {
+  # List all counties for the state
+  dfw_counties <- fips_codes %>%
+    filter(state == state_abbreviation) %>%
+    pull(county)
+  
+  # Retrieve ACS data for the state
+  dfw_data <- get_acs(
+    geography = "tract", # get data at the tract level
+    variables = variables_to_get,
+    state = state_abbreviation,
+    county = dfw_counties,
+    geometry = TRUE,
+    output = "wide",
+    year = 2020
+  ) %>%
+    select(-NAME) %>%
+    filter(!is.na(median_valueE))  # Remove missing values
+  
+  # Create Median Home Value Map
+  mhv_map <- ggplot(dfw_data, aes(fill = median_valueE)) + 
+    geom_sf(color = NA) + 
+    scale_fill_viridis_c(labels = scales::label_dollar()) + 
+    theme_void() + 
+    labs(fill = "Median Home Value ($)", title = paste("Median Home Value Map -", state_abbreviation)) +
+    theme(axis.text=element_text(size=6),
+          plot.title = element_text(size=10),
+          axis.title = element_text(size=8),
+          legend.title = element_text(size = 8))
+  
+  # Create Median Home Value Histogram
+  mhv_histogram <- ggplot(dfw_data, aes(x = median_valueE)) + 
+    geom_histogram(alpha = 0.7, fill = "navy", color = "navy", bins = 100) + 
+    theme_minimal() + 
+    scale_x_continuous(labels = scales::label_dollar()) + 
+    labs(x = "Median Home Value ($)", y = "Count", title = paste("Median Home Value Distribution -", state_abbreviation)) +
+    theme(axis.text=element_text(size=6),
+          plot.title = element_text(size=10),
+          axis.title = element_text(size=8),
+          legend.title = element_text(size = 8))
+  
+  # Create Log-transformed Median Home Value Map
+  mhv_map_log <- ggplot(dfw_data, aes(fill = log(median_valueE))) + 
+    geom_sf(color = NA) + 
+    scale_fill_viridis_c() + 
+    theme_void() + 
+    labs(fill = "Log(Median Home Value)", title = paste("Log Median Home Value Map -", state_abbreviation))+
+    theme(axis.text=element_text(size=6),
+          plot.title = element_text(size=10),
+          axis.title = element_text(size=8),
+          legend.title = element_text(size = 8))
+  
+  # Create Log-transformed Median Home Value Histogram
+  mhv_histogram_log <- ggplot(dfw_data, aes(x = log(median_valueE))) + 
+    geom_histogram(alpha = 0.7, fill = "navy", color = "navy", bins = 100) + 
+    theme_minimal() + 
+    scale_x_continuous() + 
+    labs(x = "Log(Median Home Value)", y = "Count", title = paste("Log Median Home Value Distribution -", state_abbreviation)) +
+    theme(axis.text=element_text(size=6),
+          plot.title = element_text(size=10),
+          axis.title = element_text(size=8),
+          legend.title = element_text(size = 8))
+  
+  # Display all plots side-by-side
+  combined_plot <- (mhv_map + mhv_histogram) / (mhv_map_log + mhv_histogram_log)
+  
+  # Print the combined plot to display
+  print(combined_plot)
+}
+
+# List of states to generate data and figures for
+create_maps_and_histograms("PA")
+create_maps_and_histograms("OH")
+create_maps_and_histograms("TN")
+create_maps_and_histograms("WV")
+create_maps_and_histograms("KY")
+create_maps_and_histograms("IN")
+create_maps_and_histograms("IL")
+```
+
+### Multiple States, Per Capita Income
+
+```{r}
+# List of variables to retrieve from the ACS
+variables_to_get <- c(
+  per_capita_income_black = "B19301B_001",   # Per capita income for Black population
+  per_capita_income_white = "B19301H_001",   # Per capita income for White (non-Hispanic) population
+  per_capita_income_hispanic = "B19301I_001",# Per capita income for Hispanic population
+  per_capita_income_asian = "B19301D_001"    # Per capita income for Asian population
+)
+
+# Function to create maps and histograms for income by race for a state
+create_income_maps_and_histograms <- function(state_abbreviation) {
+  # List all counties for the state
+  state_counties <- fips_codes %>%
+    filter(state == state_abbreviation) %>%
+    pull(county)
+  
+  # Retrieve ACS data for the state
+  income_data <- get_acs(
+    geography = "tract", # get data at the tract level
+    variables = variables_to_get,
+    state = state_abbreviation,
+    county = state_counties,
+    geometry = TRUE,
+    output = "wide",
+    year = 2020
+  ) %>%
+    select(-NAME)  # Remove the name column
+  
+  # Create function to generate plots for each race, with filtering for NA values
+  create_plots_for_race <- function(race_col, race_label, color, log_color) {
+    # Filter out NAs for the specific race
+    income_data_race <- income_data %>%
+      filter(!is.na(!!sym(race_col)))
+    
+    # Create Per Capita Income Map for the race
+    income_map <- ggplot(income_data_race, aes(fill = !!sym(race_col))) + 
+      geom_sf(color = NA) + 
+      scale_fill_viridis_c(labels = scales::label_dollar()) + 
+      theme_void() + 
+      labs(fill = "Per Capita Income ($)", title = paste("Per Capita Income (", race_label, ") -", state_abbreviation)) +
+      theme(axis.text=element_text(size=6),
+            plot.title = element_text(size=10),
+            axis.title = element_text(size=8),
+            legend.title = element_text(size = 8))
+    
+    # Create Per Capita Income Histogram for the race
+    income_histogram <- ggplot(income_data_race, aes(x = !!sym(race_col))) + 
+      geom_histogram(alpha = 0.7, fill = color, color = color, bins = 100) + 
+      theme_minimal() + 
+      scale_x_continuous(labels = scales::label_dollar()) + 
+      labs(x = "Per Capita Income ($)", y = "Count", title = paste("Per Capita Income Distribution (", race_label, ") -", state_abbreviation)) +
+      theme(axis.text=element_text(size=6),
+            plot.title = element_text(size=10),
+            axis.title = element_text(size=8),
+            legend.title = element_text(size = 8))
+    
+    # Log-transformed map for the race
+    income_map_log <- ggplot(income_data_race, aes(fill = log(!!sym(race_col)))) + 
+      geom_sf(color = NA) + 
+      scale_fill_viridis_c() + 
+      theme_void() + 
+      labs(fill = "Log(Per Capita Income)", title = paste("Log Per Capita Income (", race_label, ") -", state_abbreviation)) +
+      theme(axis.text=element_text(size=6),
+            plot.title = element_text(size=10),
+            axis.title = element_text(size=8),
+            legend.title = element_text(size = 8))
+    
+    # Log-transformed histogram for the race
+    income_histogram_log <- ggplot(income_data_race, aes(x = log(!!sym(race_col)))) + 
+      geom_histogram(alpha = 0.7, fill = log_color, color = log_color, bins = 100) + 
+      theme_minimal() + 
+      scale_x_continuous() + 
+      labs(x = "Log(Per Capita Income)", y = "Count", title = paste("Log Per Capita Income Distribution (", race_label, ") -", state_abbreviation)) +
+      theme(axis.text=element_text(size=6),
+            plot.title = element_text(size=10),
+            axis.title = element_text(size=8),
+            legend.title = element_text(size = 8))
+    
+    # Combine the map and histogram for both original and log-transformed data
+    combined_plot <- (income_map + income_histogram) / (income_map_log + income_histogram_log)
+    
+    return(combined_plot)
+  }
+  
+  # Create plots for each race (White, Black, Hispanic, Asian) and filter NAs for each race
+  white_plots <- create_plots_for_race("per_capita_income_whiteE", "White", "navy", "lightblue")
+  black_plots <- create_plots_for_race("per_capita_income_blackE", "Black", "darkred", "pink")
+  hispanic_plots <- create_plots_for_race("per_capita_income_hispanicE", "Hispanic", "darkgreen", "lightgreen")
+  asian_plots <- create_plots_for_race("per_capita_income_asianE", "Asian", "darkorange", "orange")
+  
+  # Print the combined plots for all races
+  print(white_plots)
+  print(black_plots)
+  print(hispanic_plots)
+  print(asian_plots)
+}
+
+# List of states to generate data and figures for
+create_income_maps_and_histograms("PA")
+create_income_maps_and_histograms("OH")
+create_income_maps_and_histograms("TN")
+create_income_maps_and_histograms("WV")
+create_income_maps_and_histograms("KY")
+create_income_maps_and_histograms("IN")
+create_income_maps_and_histograms("IL")
+
+
+
+```
+
+## ACS Per Capita Income Data (county & state level)
+
+```{r ACS Per Capita Income Data, message=FALSE, warning=FALSE, echo=TRUE}
+
+# List of states for which to retrieve data
+states <- c("OH", "PA", "TN", "WV", "KY", "IN", "IL")
+
+# Define the variables to retrieve from the ACS
+variables_to_get <- c(
+  population = "B01003_001",               # Total population
+  population_black = "B02001_003",         # Total Black population
+  population_white = "B02001_002",         # Total White (non-Hispanic) population
+  population_hispanic = "B03003_003",      # Total Hispanic population
+  population_asian = "B02001_005",         # Total Asian population
+
+  per_capita_income_black = "B19301B_001",   # Per capita income for Black population
+  per_capita_income_black_moe = "B19301B_001M",  # MOE for Black per capita income
+  per_capita_income_white = "B19301H_001",   # Per capita income for White (non-Hispanic) population
+  per_capita_income_white_moe = "B19301H_001M",  # MOE for White per capita income
+  per_capita_income_hispanic = "B19301I_001",# Per capita income for Hispanic population
+  per_capita_income_hispanic_moe = "B19301I_001M",  # MOE for Hispanic per capita income
+  per_capita_income_asian = "B19301D_001",   # Per capita income for Asian population
+  per_capita_income_asian_moe = "B19301D_001M"  # MOE for Asian per capita income
+)
+
+# Function to retrieve and process data for each state
+retrieve_data_for_county <- function(state_abbreviation) {
+  # List all counties in the state
+  state_counties <- list_counties_by_state(state_abbreviation)
+  
+  # Retrieve ACS data for the state's counties
+  state_data <- get_acs(
+    geography = "county",
+    variables = variables_to_get,
+    state = state_abbreviation,
+    county = state_counties,
+    geometry = TRUE,
+    output = "wide",
+    year = 2020
+  ) %>%
+    select(-NAME) %>%
+    st_transform(crs = 5070) %>%
+    mutate(state = state_abbreviation)
+  
+  return(state_data)
+}
+
+# List of counties by state
+list_counties_by_state <- function(state_abbreviation) {
+  fips_codes %>%
+    filter(state == state_abbreviation) %>%
+    pull(county)
+}
+
+# Retrieve data for all selected states
+all_data <- lapply(states, retrieve_data_for_county)
+
+# Combine data for all counties by state
+percapita_income_combined_data_county <- bind_rows(all_data)
+
+# Function to retrieve and process data for each state
+retrieve_data_for_state <- function(state_abbreviation) {
+  # List all counties in the state
+  state_counties <- list_counties_by_state(state_abbreviation)
+  
+  # Retrieve ACS data for the state's counties
+  state_data <- get_acs(
+    geography = "state",
+    variables = variables_to_get,
+    state = state_abbreviation,
+    county = state_counties,
+    geometry = TRUE,
+    output = "wide",
+    year = 2020
+  ) %>%
+    select(-NAME) %>%
+    st_transform(crs = 5070) %>%
+    mutate(state = state_abbreviation)
+  
+  return(state_data)
+}
+
+# List of counties by state
+list_counties_by_state <- function(state_abbreviation) {
+  fips_codes %>%
+    filter(state == state_abbreviation) %>%
+    pull(county)
+}
+
+# Retrieve data for all selected states
+all_data <- lapply(states, retrieve_data_for_state)
+
+# Combine data for all states
+percapita_income_combined_data_state <- bind_rows(all_data)
+
+
+percapita_income_combined_data_county 
+
+percapita_income_combined_data_state
+```

@@ -1,0 +1,404 @@
+---
+title: "**EPA NEI Emissions Trends**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+header-includes:
+  - |
+    <style>
+      pre, code { font-size: 0.9em; line-height: 1.3; }
+    </style>
+---
+
+```{r setup, include=FALSE}
+
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Install and load necessary packages
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+# Load Libraries in R Script
+if (!require("pacman")) install.packages("pacman")
+
+# Data manipulation and general utilities
+pacman::p_load(
+  broom, devtools,dplyr, fs, glue, here, htmltools, janitor, knitr, 
+  latex2exp, lubridate, markdown, metajam, magick, png, purrr, RColorBrewer, readr, remotes, 
+  rmarkdown, stringr, tibble, tidyr, tidyverse, units, usethis, readr, readxl, gmp, multcompView, reshape2, htmltools, shiny, car, here
+)
+
+# Plotting and visualization
+pacman::p_load(
+  # plotting packages 
+  cowplot, DT, ggforce, ggfx, ggimage, gginnards, ggplot2, gganimate, gt, gtExtras,
+  ggpmisc, ggpp, ggpubr, ggrepel, ggsci, ggstatsplot, ggsignif, ggthemes, ggtext,
+  grid, gridExtra, plotly, patchwork, scales, viridis, viridisLite,
+  # table packages
+  gt, gtExtras, gtsummary, kableExtra, 
+  # gis and mapping packages
+  sf, raster, ggmap, tmap, tmaptools, rnaturalearth, rnaturalearthdata
+)
+
+# Environmental Analysis Packages
+
+# Social & Environmental Analysis Packages 
+pacman::p_load(
+  tigris, EDIutils, ineq, ipumsr, tigris, tidycensus
+)
+
+options(tigris_use_cache = TRUE)
+options(readr.show_col_types = FALSE)
+```
+
+# NEI Emissions Data
+
+## Visualizing National/State Trends in Emissions Data
+
+Data Downloaded from U.S. Environmental Protection Agency (EPA). “Pollutant Emissions Trends Data.” National Air Quality website, February 2024. Available at EPA Pollutant Emissions Trends (Link)[https://www.epa.gov/air-emissions-inventories/air-pollutant-emissions-trends-data]
+
+Datasets:
+National Tier 1 CAPS Trends riteria pollutants National Tier 1 for 1970 - 2023.
+National and State CAPS Trends by Tier 1 and EIS Sector National and State CAPS Trends by Tier 1 and EIS Sector for 2002 - 2023.
+
+
+```{r National and State Trends}
+
+# Load national data (assuming it's available in the dataset)
+national_air_pollution_trends_data <- read.csv(here::here("Data",  "EPA_NEI_National_State_Trends", "National_State_Tier1_Sector_2002_2023_Caps - National.csv"))
+
+# Clean the national dataset
+national_air_pollution_cleaned <- national_air_pollution_trends_data %>%
+  gather(key = "year", value = "emissions", starts_with("emissions")) %>%
+  mutate(year = as.numeric(gsub("emissions", "", year))) %>%
+  filter(!is.na(emissions)) %>% 
+  filter(Pollutant %in% c("NH3", "NOX", "SO2", "PMI", "PM10-PRI", "PM25-PRI"))
+
+# Calculate mean emissions by year and pollutant at the national level
+national_means <- national_air_pollution_cleaned %>%
+  group_by(year, Pollutant) %>%
+  dplyr::summarize(mean_emissions = mean(emissions, na.rm = TRUE))
+
+# Plot national mean emissions over time
+ggplot(national_means, aes(x = year, y = mean_emissions, color = Pollutant)) +
+  geom_line(size = 1.2) +
+  labs(title = "National Air Pollution Trends for Selected Pollutants (2002-2023)",
+       x = "Year",
+       y = "Mean Emissions (tons)",
+       color = "Pollutant") +
+  theme_minimal()
+
+# Calculate mean emissions by year and pollutant at the state level
+# Load the dataset skipping initial rows and renaming columns
+nox_data <- read.csv(here::here("Data",  "EPA_NEI_National_State_Trends",
+                                "National_Tier1_CAPS_Trends - NOX.csv"), 
+                   skip = 5)
+so2_data <- read.csv(here::here("Data",  "EPA_NEI_National_State_Trends",
+                                "National_Tier1_CAPS_Trends - SO2.csv"), 
+                   skip = 5)
+
+clean_pollutant_data <- function(data, pollutant_name) {
+  data %>%
+    pivot_longer(
+      cols = starts_with("X"), 
+      names_to = "Year", 
+      values_to = "Emissions"
+    ) %>%
+    mutate(
+      Year = as.numeric(gsub("X", "", Year)),
+      Emissions = as.numeric(gsub("[^0-9\\.]", "", Emissions)), # Remove non-numeric characters
+      Pollutant = pollutant_name
+    ) %>%
+    filter(!is.na(Emissions)) %>% 
+    mutate(Source.Category = toupper(Source.Category))
+}
+
+# Apply the updated cleaning function
+nox_cleaned <- clean_pollutant_data(nox_data, "NOX")
+so2_cleaned <- clean_pollutant_data(so2_data, "SO2")
+
+ggplot(nox_cleaned, aes(x = Year, y = Emissions, color = Pollutant)) +
+  geom_line() +
+  facet_wrap(~Source.Category, scales = "free_y", ncol=4) +
+  scale_color_manual(values = c("NOX" = "royalblue", "SO2" = "orangered")) +
+  labs(title = "Emissions Over Time by Pollutant (NOX)",
+       x = "Year",
+       y = "Emissions",
+       color = "Pollutant") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        text = element_text(size = 7),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 5),
+        title = element_text(size = 10))
+
+ggplot(so2_cleaned, aes(x = Year, y = Emissions, color = Pollutant)) +
+  geom_line() +
+  facet_wrap(~Source.Category, scales = "free_y", ncol=4) +
+  scale_color_manual(values = c("NOX" = "royalblue", "SO2" = "orangered")) +
+  labs(title = "Emissions Over Time by Pollutant (SO2)",
+       x = "Year",
+       y = "Emissions",
+       color = "Pollutant") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        text = element_text(size = 7),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 5),
+        title = element_text(size = 10))
+
+```
+# NEI Emissions Data
+
+## Loading and Plotting the Distribution of Facilities 
+
+```{r}
+
+
+# Define the file path
+file_path <- here::here("Data", "EPA_NEI_National_State_Trends", "NEI_2020_Acidfying_Gases_States_of_Interest.xlsx")
+
+# Load the data from the first sheet
+acid_gases_data <- read_excel(file_path)
+
+# If you need to load a specific sheet, specify it like this:
+# acid_gases_data <- read_excel(file_path, sheet = "Sheet1")
+
+# Extract Latitude and Longitude from the Lat/Lon column
+acid_gases_data <- acid_gases_data %>%
+  mutate(
+    Longitude = as.numeric(gsub("\\[|\\]|,.*", "", `Lat/Lon`)),
+    Latitude = as.numeric(gsub("\\[|\\]|.*,", "", `Lat/Lon`)),
+    .keep = "unused"
+  )
+
+# Convert to an sf object
+acid_gases_sf <- acid_gases_data %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+# Load state boundaries
+states <- states(cb = TRUE) %>% suppressMessages()
+
+# Plot the emissions data with state boundaries, faceted by Pollutant
+ggplot() +
+  geom_sf(data = states, fill = NA, color = "black") +  # Add state boundaries
+  geom_sf(data = acid_gases_sf, aes(size = `Emissions (Tons)`, color = Pollutant),
+          alpha = 0.7, size=0.2)+
+  theme_minimal() +
+  coord_sf(xlim = c(-92.5, -72.5), ylim = c(34, 44)) +  # Adjust the coordinate limits if needed
+  labs(title = "Acidifying Gas Emissions by Facility",
+       subtitle = "Locations of Point Source Facilities",
+       color = "Pollutant", size = "Emissions (Tons)") +
+  theme(
+    legend.position = "bottom",  # Move legend to the bottom
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.box = "horizontal"  # Arrange the legends horizontally
+  ) +
+  facet_wrap(~ Pollutant)  # Keep faceting by Pollutant
+
+# Filter the data for SO2 emissions
+SO2_data <- acid_gases_data %>%
+  filter(Pollutant == "Sulfur Dioxide")
+
+# Convert to an sf object
+SO2_sf <- SO2_data %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+# Plot the SO2 emissions data with state boundaries
+ggplot() +
+  geom_sf(data = states, fill = NA, color = "black") +  # Add state boundaries
+  geom_sf(data = SO2_sf, aes(size = `Emissions (Tons)`), color = "royalblue", alpha = 0.7) +
+  theme_minimal() +
+  coord_sf(xlim = c(-92.5, -72.5), ylim = c(34, 44)) +  # Adjust the coordinate limits if needed
+  scale_size_continuous(range = c(1, 5), limits = c(0, 30000)) +  # Adjust the point size based on emission tons
+  labs(title = "Sulfur Dioxide (SO₂) Emissions by Facility",
+       subtitle = "Distribution and Intensity of Emissions",
+       size = "Emissions (Tons)") +
+  theme(
+    legend.position = "bottom",  # Move legend to the bottom
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.box = "horizontal"  # Arrange the legends horizontally
+  )
+
+# Filter the data for NOₓ emissions
+NOx_data <- acid_gases_data %>%
+  filter(Pollutant == "Nitrous Oxide")
+
+# Convert to an sf object
+NOx_sf <- NOx_data %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+# Plot the NOₓ emissions data with state boundaries
+ggplot() +
+  geom_sf(data = states, fill = NA, color = "black") +  # Add state boundaries
+  geom_sf(data = NOx_sf, aes(size = `Emissions (Tons)`), color = "lightgreen", alpha = 0.7) +
+  theme_minimal() +
+  coord_sf(xlim = c(-92.5, -72.5), ylim = c(34, 44)) +  # Adjust the coordinate limits if needed
+  scale_size_continuous(range = c(1, 5), limits = c(0, 1000)) +  # Adjust the point size based on emission tons
+  labs(title = "Nitrous Oxide (NOx) Emissions by Facility",
+       subtitle = "Distribution and Intensity of Emissions",
+       size = "Emissions (Tons)") +
+  theme(
+    legend.position = "bottom",  # Move legend to the bottom
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.box = "horizontal"  # Arrange the legends horizontally
+  )
+
+# Filter the data for Ammonia emissions
+Ammonia_data <- acid_gases_data %>%
+  filter(Pollutant == "Ammonia")
+
+# Convert to an sf object
+Ammonia_sf <- Ammonia_data %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+# Plot the Ammonia emissions data with state boundaries
+ggplot() +
+  geom_sf(data = states, fill = NA, color = "black") +  # Add state boundaries
+  geom_sf(data = Ammonia_sf, aes(size = `Emissions (Tons)`), color = "orangered", alpha = 0.7) +
+  theme_minimal() +
+  coord_sf(xlim = c(-92.5, -72.5), ylim = c(34, 44)) +  # Adjust the coordinate limits if needed
+  scale_size_continuous(range = c(1, 5), limits = c(0, 1200)) +  # Adjust the point size based on emission tons
+  labs(title = "Ammonia (NH₄) Emissions by Facility",
+       subtitle = "Distribution and Intensity of Emissions",
+       size = "Emissions (Tons)") +
+  theme(
+    legend.position = "bottom",  # Move legend to the bottom
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.box = "horizontal"  # Arrange the legends horizontally
+  )
+```
+# Emissions Rankings by State, County, & Industry
+
+```{r}
+# Group by State and Pollutant, then calculate total emissions and count the number of facilities
+state_facilities_ranking <- acid_gases_data %>%
+  group_by(State, Pollutant) %>%
+  summarize(
+    Facility_Count = n(),  # Count the number of facilities
+    Total_Emissions = sum(`Emissions (Tons)`, na.rm = TRUE)  # Sum the emissions
+  ) %>%
+  arrange(desc(Total_Emissions))
+
+# Print the result
+print(state_facilities_ranking)
+
+# Group by State-County and Pollutant, then calculate total emissions and count the number of facilities
+county_facilities_ranking <- acid_gases_data %>%
+  group_by(`State-County`, Pollutant) %>%
+  summarize(
+    Facility_Count = n(),  # Count the number of facilities
+    Total_Emissions = sum(`Emissions (Tons)`, na.rm = TRUE)  # Sum the emissions
+  ) %>%
+  arrange(desc(Total_Emissions))
+
+# Print the result
+print(county_facilities_ranking)
+
+# Group by NAICS and Pollutant, then calculate total emissions and count the number of facilities
+industry_facilities_ranking <- acid_gases_data %>%
+  group_by(NAICS, Pollutant) %>%
+  summarize(
+    Facility_Count = n(),  # Count the number of facilities
+    Total_Emissions = sum(`Emissions (Tons)`, na.rm = TRUE)  # Sum the emissions
+  ) %>%
+  arrange(desc(Total_Emissions))
+
+# Print the result
+print(industry_facilities_ranking)
+
+
+```
+### County Emissions 
+
+```{r}
+
+# Download county boundaries for the entire U.S.
+counties <- counties(cb = TRUE, resolution = "5m", year=2020) %>% 
+  st_as_sf()  # Convert to an sf object
+
+# Merge the county facilities ranking with the spatial county boundaries using the FIPS code
+county_map_data <- counties %>%
+  left_join(acid_gases_data %>%
+              group_by(FIPS, Pollutant) %>% 
+              summarize(
+                Facility_Count = n(),
+                Total_Emissions = sum(`Emissions (Tons)`, na.rm = TRUE)
+              ), by = c("GEOID" = "FIPS"))
+
+# Check the merged data
+head(county_map_data)
+
+# Ensure the 'NA' values in the Pollutant column are excluded
+county_map_data <- county_map_data %>%
+  dplyr::filter(!is.na(Pollutant))
+
+# Function to plot each pollutant separately with a more visible gradient
+plot_pollutant_separately <- function(data, variable, title, subtitle) {
+  unique_pollutants <- unique(data$Pollutant)
+  
+  plots <- lapply(unique_pollutants, function(pollutant) {
+    p_data <- data %>% dplyr::filter(Pollutant == pollutant)
+    
+    # Calculate the range of the data for the current pollutant
+    value_range <- range(p_data[[variable]], na.rm = TRUE)
+    
+    ggplot(data = p_data) +
+      geom_sf(aes_string(fill = variable)) +
+      scale_fill_viridis_c(
+        option = "C", 
+        limits = value_range,  # Use the range of the current data
+        trans = "log",  # Apply a logarithmic transformation for better visibility
+        breaks = scales::pretty_breaks(n = 5)  # Adjust the number of breaks in the gradient
+      ) +
+      coord_sf(xlim = c(-92.5, -72.5), ylim = c(34, 44)) +  # Adjust the coordinate limits if needed
+      labs(title = paste(title, "-", pollutant),
+           subtitle = subtitle,
+           fill = variable) +
+      theme_minimal()
+  })
+  
+  return(plots)
+}
+
+# Plot the Facility Count by County separately for each pollutant
+facility_count_plots <- plot_pollutant_separately(
+  county_map_data,
+  "Facility_Count",
+  "Facility Count by County",
+  "Total number of facilities per county"
+)
+
+# Plot the Total Emissions by County separately for each pollutant
+total_emissions_plots <- plot_pollutant_separately(
+  county_map_data,
+  "Total_Emissions",
+  "Total Emissions by County",
+  "Total emissions in tons per county"
+)
+
+# Display the plots
+facility_count_plots[[1]]
+facility_count_plots[[2]]
+facility_count_plots[[3]]
+
+total_emissions_plots[[1]]
+total_emissions_plots[[2]]
+total_emissions_plots[[3]]
+```
+
+

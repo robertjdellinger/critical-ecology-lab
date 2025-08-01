@@ -1,0 +1,605 @@
+---
+title: "**Data Wrangling: Historical Segregation Data**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+header-includes:
+  - |
+    <style>
+      pre, code { font-size: 0.9em; line-height: 1.3; }
+    </style>
+---
+
+
+# **Mapping Inequality: Redlining**
+
+Redlining refers to the discriminatory practice that emerged in the 1930s when the Home Owners' Loan Corporation (HOLC) created maps to guide investment and lending decisions.
+These maps categorized neighborhoods based on perceived financial risk, heavily influenced by racial and ethnic composition.
+Areas with a high percentage of racial minorities were often marked in red, indicating them as high-risk or undesirable for investment.
+This practice led to decades of disinvestment in minority neighborhoods, contributing significantly to the racial wealth gap.
+The [Mapping Inequality](https://dsl.richmond.edu/panorama/redlining) project by the University of Richmond has digitized these historical redlining maps, providing a crucial resource for understanding the long-term impacts of these policies.
+This document demonstrates how to download and visualize the redlining data for Los Angeles, CA using R (these maps can be replicated for any of the cities listed on the Mapping Inequality site as well as nationally).
+
+This document demonstrates how to download and visualize the redlining data using R and how to crosswalk the data to the US Census tract level.
+
+## Setup Packages
+
+```{r setup-packages, include=FALSE}
+
+# Clear workspace
+rm(list = ls())
+
+# Install and load pacman
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+library(pacman)
+
+# Load core data wrangling & utility packages
+p_load(
+  tidyverse, dplyr, tidyr, purrr, stringr, readr, readxl, lubridate, janitor, glue, here,rstatix,
+  fs, tibble, units, usethis, Hmisc)
+
+# Visualization packages
+p_load(
+  ggplot2, ggtext, ggrepel, ggsci, ggthemes, ggpubr, cowplot, patchwork, gridExtra,
+  scales, viridis, viridisLite, gganimate, ggimage, plotly, ggstatsplot, ggsignif,
+  gt, gtExtras, gtsummary, kableExtra, scales, haven)
+
+# GIS & spatial data
+p_load(
+  sf, raster, tigris, tidycensus, ggmap, tmap, tmaptools,
+  rnaturalearth, rnaturalearthdata)
+
+# Reproducibility, formatting, and environment
+p_load(
+  knitr, rmarkdown, devtools, remotes, sessioninfo, tinytex, markdown)
+
+# Set options
+options(tigris_use_cache = TRUE)
+options(readr.show_col_types = FALSE)
+
+# Set output paths
+output_path_images <- here("Output", "Figures")
+output_path_tables <- here("Output", "Tables")
+
+# Chunk rendering options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = FALSE,
+  out.width = "100%",
+  fig.align = "center",
+  dpi = 800
+)
+
+
+```
+
+## Example HOLC Data
+
+```{r}
+# Parameters
+la_county_name <- "Los Angeles"
+holc_url       <- "https://dsl.richmond.edu/panorama/redlining/static/citiesData/CALosAngeles1939/geojson.json"
+palette_holc    <- c(
+  "A" = "#2E8B57",
+  "B" = "#4682B4",
+  "C" = "#FFD700",
+  "D" = "#DC143C"
+)
+xlim <- c(-118.6, -117.7)
+ylim <- c( 33.7,   34.3)
+
+# Load & clean HOLC data
+holc_la <- st_read(holc_url, quiet = TRUE) %>%
+  st_transform(4326) %>%
+  dplyr::filter(!is.na(grade)) %>%
+  st_make_valid() %>%
+  st_simplify(dTolerance = 0.01)
+
+#  Load LA County boundary
+la_county <- counties("CA", cb = TRUE, year = 2020, class = "sf") %>%
+  dplyr::filter(NAME == la_county_name) %>%
+  st_transform(4326) %>%
+  st_make_valid()
+
+# Clip HOLC to LA only
+holc_la <- st_intersection(holc_la, la_county)
+
+# Du Bois–inspired theme
+theme_du_bois <- function() {
+  theme_minimal(base_family = "sans", base_size = 12) %+replace%
+    theme(
+      # warm off‐white paper tone
+      plot.background   = element_rect(fill = NA, colour = NA),
+      panel.background  = element_rect(fill = NA, colour = NA),
+      # subtle dotted grid reminiscent of period illustrations
+      panel.grid.major  = element_line(colour = "grey80", linetype = "dotted", size = 0.3),
+      panel.grid.minor  = element_blank(),
+      # a thin “frame” around the map
+      panel.border      = element_rect(colour = "grey60", fill = NA, size = 0.6),
+      # remove axes
+      axis.text         = element_blank(),
+      axis.ticks        = element_blank(),
+      axis.title        = element_blank(),
+      # titles in sturdy sans
+      plot.title        = element_text(
+        family = "sans", face = "bold", size = 24,
+        hjust = 0.5, margin = margin(b = 10)
+      ),
+      plot.subtitle     = element_text(
+        family = "sans", face = "italic", size = 16,
+        hjust = 0.5, margin = margin(b = 15)
+      ),
+      # small sans caption, centered
+      plot.caption      = element_text(
+        family = "sans", size = 9, hjust = 0.5,
+        margin = margin(t = 10)
+      ),
+      # legend at bottom, with clear keys
+      legend.position   = "bottom",
+      legend.title      = element_text(family = "sans", face = "bold", size = 11),
+      legend.text       = element_text(family = "sans", size = 9),
+      legend.key        = element_rect(fill = "white", colour = NA),
+      legend.background = element_rect(fill = "transparent", colour = NA),
+      # generous plot margins
+      plot.margin       = margin(20, 20, 20, 20)
+    )
+}
+
+# Build the map (assign to object!)
+p_la_redline <- ggplot() +
+  # base county
+  geom_sf(data = la_county, fill = "grey95", color = "grey40", size = 0.3) +
+  # HOLC overlay
+  geom_sf(data = holc_la, aes(fill = grade), color = "grey20", size = 0.2) +
+  # grading palette
+  scale_fill_manual(
+    name   = "HOLC Grade",
+    values = palette_holc,
+    labels = c("A — 'Best'", "B — 'Still Desirable'", "C — 'Defintely Declining'", "D — 'Hazardous'")
+  ) +
+  # zoom in
+  coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+  # titles & theme
+  labs(
+    title    = "Redlining in Los Angeles (1939)",
+    subtitle = "Historic HOLC Grades over Modern LA County",
+    caption  = "Source: U.S. Federal Government Home Owners’ Loan Corporation (1939)\nMapping Inequality Project, University of Richmond"
+  ) +
+  theme_du_bois()
+
+# 6) Display & save
+print(p_la_redline)
+
+ggsave(
+  filename = here("Output/Figures/HOLC_Redlining_Example.png"),
+  plot     = p_la_redline,
+  width    = 8,
+  height   = 7,
+  dpi      = 600
+)
+```
+# Loading in Data (Mapping Inequality Data)
+
+Robert K. Nelson, LaDale Winling, Richard Marciano, Nathan Connolly, et al., “Mapping Inequality,” American Panorama, ed. Robert K. Nelson and Edward L. Ayers, accessed September 18, 2020, https://dsl.richmond.edu/panorama/redlining/ and https://github.com/americanpanorama/Census_HOLC_Research/tree/main/2020_Census_Tracts
+
+## Census Tract Crosswalk Data 
+
+```{r census-tracts-holc-crosswalk}
+# ---- Parameters ----
+states_of_interest <- c("IL","IN","KY","OH","PA","TN","WV")
+crosswalk_url <- paste0(
+  "https://raw.githubusercontent.com/",
+  "americanpanorama/mapping-inequality-census-crosswalk/",
+  "main/MIv3Areas_2020TractCrosswalk.geojson"
+)
+
+# ---- 1. Load and clean HOLC crosswalk ----
+holc_tracts_sf <- st_read(crosswalk_url, quiet = TRUE) %>%
+  filter(state %in% states_of_interest) %>%
+  mutate(
+    grade = str_trim(grade),
+    grade = na_if(grade, ""), 
+    grade = if_else(grade %in% c("A","B","C","D"), grade, NA_character_),
+    grade = factor(grade, levels = c("A","B","C","D")),
+    holc_grade = factor(
+      grade,
+      levels = c("A","B","C","D"),
+      labels = c("Best", "Still Desirable", "Declining", "Hazardous")
+    )
+  ) %>%
+  filter(!is.na(grade)) %>%                             # drop anything without A–D
+  # topology repair: go to metric, make valid, buffer to fix self-intersections, return to geographic
+  st_transform(3857) %>%
+  st_make_valid() %>%
+  st_buffer(0) %>%
+  st_transform(4326) %>%
+  # if any GEOMETRYCOLLECTIONs remain, extract their POLYGON / MULTIPOLYGON parts
+  { if (any(st_geometry_type(.) %in% "GEOMETRYCOLLECTION")) st_collection_extract(., c("POLYGON","MULTIPOLYGON")) else . } %>%
+  st_cast("MULTIPOLYGON") %>%                           # unify type
+  filter(!st_is_empty(.)) %>%                           # drop true empty geometries (you had 9)
+  dplyr::select(                                        # keep explicit columns
+    area_id, city, state, cat, grade, holc_grade, label,
+    GEOID, GISJOIN, calc_area, pct_tract, geometry
+  )
+
+# optional check: all geometries valid now
+if (any(!st_is_valid(holc_tracts_sf))) {
+  warning("Some HOLC geometries remain invalid after repair.")
+}
+
+print(holc_tracts_sf)
+```
+
+
+
+## Visualizing HOLC Tracts
+
+```{r census-tracts-holc-maps}
+
+palette_holc <- c(
+  A = "#2E8B57",
+  B = "#4682B4",
+  C = "#FFD700",
+  D = "#DC143C"
+)
+
+# grab only the cities that survived your filter(!is.na(grade))
+cities_with_grade <- holc_tracts_sf %>%
+  st_drop_geometry() %>%
+  distinct(city, grade) %>%
+  count(city) %>%
+  filter(n > 0) %>%
+  pull(city)
+
+for(city_name in cities_with_grade) {
+  sf_city <- holc_tracts_sf %>% filter(city == city_name)
+  
+  # compute tight bounding box on non-empty sf
+  bb <- st_bbox(sf_city)
+  
+  p <- ggplot(sf_city) +
+    geom_sf(aes(fill = grade), color = "grey20", size = 0.2) +
+    
+    scale_fill_manual(
+      name   = "HOLC Grade",
+      values = palette_holc,
+      labels = c(
+        A = "A — Best",
+        B = "B — Still Desirable",
+        C = "C — Declining",
+        D = "D — Hazardous"
+      ),
+      drop = FALSE
+    ) +
+    coord_sf(
+      xlim   = c(bb["xmin"], bb["xmax"]),
+      ylim   = c(bb["ymin"], bb["ymax"]),
+      expand = FALSE
+    ) +
+    labs(
+      title    = glue::glue("HOLC Redlining: {city_name} (1939)"),
+      subtitle = "Mapping Inequality crosswalk — CDC SVI & American Panorama",
+      caption  = "Source: U.S. Federal Government (HOLC, 1939)\nMapping Inequality Project, University of Richmond"
+    ) +
+    theme_du_bois()
+  
+  print(p)
+}
+```
+
+# Merging facilitties to census tracts
+
+```{r facilities, include=TRUE, evaluate=FALSE}
+CAMPD_facility_summaries_1995_2020 <- read_csv(here::here("Output", "Sheets", "CAMPD_facility_summaries_1995_2020.csv"))
+head(CAMPD_facility_summaries_1995_2020)
+
+annual_by_facility <- CAMPD_facility_summaries_1995_2020 %>%
+  mutate(
+    so2mass  = as.numeric(so2mass),
+    nox_mass = as.numeric(nox_mass),
+    co2mass  = as.numeric(co2mass)
+  ) %>%
+  group_by(state_code, facility_id, latitude, longitude, year) %>%
+  summarise(
+    so2_tons = sum(so2mass, na.rm = TRUE),
+    nox_tons = sum(nox_mass, na.rm = TRUE),
+    co2_tons = sum(co2mass, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Convert to sf object
+annual_by_facility_sf <- annual_by_facility %>%
+  dplyr::filter(!is.na(longitude), !is.na(latitude)) %>% # remove missing coords
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs    = 4326, # WGS84, standard for lat/lon
+    remove = FALSE # keep the lon/lat columns as regular columns too
+  )
+
+# Inspect the sf object
+print(annual_by_facility_sf)
+
+
+# Filter the annual emissions data for the states of interest and years 2016-2020
+# Create a summary table with total and average emissions per facility in order to compare with census data
+annual_by_facility_filtered_sf <- annual_by_facility_sf %>% 
+  dplyr::filter(
+    state_code %in% c("IL", "IN", "KY", "OH", "PA", "TN", "WV"),
+    year >= 2016, year <= 2020
+  ) %>%
+  group_by(state_code, facility_id, latitude, longitude) %>%
+  summarise(
+    avg_so2 = mean(so2_tons, na.rm = TRUE),
+    avg_nox = mean(nox_tons, na.rm = TRUE),
+    avg_co2 = mean(co2_tons, na.rm = TRUE),
+    years_count = n()
+  )
+
+print(annual_by_facility_filtered_sf)
+
+# Lo Load the median income tracts for the states of interest
+median_income_tracts <- get_acs(
+  geography = "tract",
+  variables = "B19013_001",
+  year = 2020,
+  survey = "acs5",
+  state = c("IL", "IN", "KY", "OH", "PA", "TN", "WV"),
+  geometry = TRUE # returns sf polygons for mapping
+)
+
+# Transform the median income tracts to match the CRS of the annual_by_facility_filtered_sf
+annual_by_facility_filtered_sf <- st_transform(annual_by_facility_filtered_sf, st_crs(median_income_tracts))
+
+# Select tract GEOID only (you'll join emissions by GEOID)
+tracts_simple <- median_income_tracts %>%
+  dplyr::select(GEOID)
+
+# Join points with tracts to get GEOID for each facility
+facilities_with_tract <- st_join(
+  annual_by_facility_filtered_sf,
+  tracts_simple,
+  join = st_within,
+  left = TRUE
+)
+
+# Count how many facilities did not join a tract (GEOID == NA)
+missing_tracts <- sum(is.na(facilities_with_tract$GEOID))
+total_facilities <- nrow(facilities_with_tract) 
+
+
+cat("Facilities not matched to a tract:", missing_tracts, "\n")
+cat("Total facilities:", total_facilities, "\n")
+cat("Percentage unmatched:", 100 * missing_tracts / total_facilities, "%\n")
+
+emissions_by_tract <- facilities_with_tract %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  summarise(
+    avg_so2_per_facility = mean(avg_so2, na.rm = TRUE),
+    avg_nox_per_facility = mean(avg_nox, na.rm = TRUE),
+    avg_co2_per_facility = mean(avg_co2, na.rm = TRUE),
+    total_so2 = sum(avg_so2, na.rm = TRUE),
+    total_nox = sum(avg_nox, na.rm = TRUE),
+    total_co2 = sum(avg_co2, na.rm = TRUE),
+    facility_count = n(),
+    .groups = "drop"
+  )
+
+tracts_with_emissions <- median_income_tracts %>%
+  left_join(emissions_by_tract, by = "GEOID") %>%
+  replace_na(list(
+    avg_so2_per_facility = 0,
+    avg_nox_per_facility = 0,
+    avg_co2_per_facility = 0,
+    total_so2 = 0,
+    total_nox = 0,
+    total_co2 = 0,
+    facility_count = 0
+  ))  %>%
+  rename(median_income = estimate) %>% 
+  st_transform(4326) %>%  # ensure geometry is in WGS84
+  na.omit(facility_count > 0)  # remove tracts with no facilities
+
+# Attach tract emissions to each HOLC piece by GEOID (no spatial overlay needed)
+holc_with_tract_data <- holc_tracts_sf %>%
+  st_drop_geometry() %>%
+  left_join(tracts_with_emissions %>% st_drop_geometry(), by = "GEOID")  # bring in income + avg_* + facility_count
+
+print(holc_with_tract_data )
+```
+
+# Plots of Total Emissions by HOLC Grade
+
+```{r figures, include=TRUE, evaluate=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)    # for comma()
+library(flextable)
+library(here)      # for saving
+
+# palette used in plots
+palette_holc <- c(
+  "Best" = "#2E8B57",
+  "Still Desirable" = "#4682B4",
+  "Declining" = "#FFD700",
+  "Hazardous" = "#DC143C"
+)
+
+# --- Total emissions by HOLC grade (collapse duplicate tract–grade overlaps) ---
+holc_totals_by_grade <- holc_with_tract_data %>%
+  distinct(GEOID, grade, .keep_all = TRUE) %>%  # one row per tract+grade
+  mutate(
+    grade = factor(
+      grade,
+      levels = c("A", "B", "C", "D"),
+      labels = c("Best", "Still Desirable", "Declining", "Hazardous"),
+      ordered = TRUE
+    )
+  ) %>%
+  group_by(grade) %>%
+  summarise(
+    median_income = median(median_income, na.rm = TRUE),
+    total_facilities = sum(facility_count, na.rm = TRUE),
+    total_SO2 = sum(total_so2, na.rm = TRUE),
+    total_NOx = sum(total_nox, na.rm = TRUE),
+    total_CO2 = sum(total_co2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+flextable(holc_totals_by_grade) %>%
+  set_header_labels(
+    grade = "HOLC Grade",
+    median_income = "Median Income ($)",
+    total_SO2 = "Total SO2 (tons/year)",
+    total_NOx = "Total NOx (tons/year)",
+    total_CO2 = "Total CO2 (tons/year)",
+    total_facilities = "Facility Count"
+  ) %>%
+  autofit() -> holc_totals_ft
+
+# --- Weighted average per facility by grade ---
+holc_avg_per_facility <- holc_totals_by_grade %>%
+  mutate(
+    avg_SO2_per_facility = if_else(total_facilities > 0, total_SO2 / total_facilities, NA_real_),
+    avg_NOx_per_facility = if_else(total_facilities > 0, total_NOx / total_facilities, NA_real_),
+    avg_CO2_per_facility = if_else(total_facilities > 0, total_CO2 / total_facilities, NA_real_)
+  ) %>%
+  dplyr::select(
+    grade, median_income,
+    avg_SO2_per_facility, avg_NOx_per_facility, avg_CO2_per_facility,
+    total_facilities
+  )
+
+# pretty table of per-facility averages
+flextable(holc_avg_per_facility) %>%
+  set_header_labels(
+    grade = "HOLC Grade",
+    median_income = "Median Income ($)",
+    avg_SO2_per_facility = "Avg SO2 / Facility (tons/yr)",
+    avg_NOx_per_facility = "Avg NOx / Facility (tons/yr)",
+    avg_CO2_per_facility = "Avg CO2 / Facility (tons/yr)",
+    total_facilities = "Facility Count"
+  ) %>%
+  autofit() -> holc_avg_ft
+
+# --- long form for plotting total emissions by pollutant and grade ---
+totals_long <- holc_totals_by_grade %>%
+  dplyr::select(grade, total_SO2, total_NOx, total_CO2) %>%
+  pivot_longer(
+    cols = starts_with("total_"),
+    names_to = "pollutant",
+    values_to = "tons"
+  ) %>%
+  mutate(
+    pollutant = recode(pollutant,
+                       total_SO2 = "SO2",
+                       total_NOx = "NOx",
+                       total_CO2 = "CO2")
+  )
+
+# faceted total emissions plot
+p_totals <- ggplot(totals_long, aes(x = grade, y = tons, fill = grade)) +
+  geom_col() +
+  facet_wrap(~ pollutant, scales = "free_y") +
+  scale_fill_manual(values = palette_holc) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Total Emissions by HOLC Grade",
+    x = "HOLC Grade",
+    y = "Total Emissions (tons)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        legend.text = element_text(size = 5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# render / save
+print(p_totals)
+
+
+ggsave(
+  filename = here::here("Output", "Figures", "HOLC_CAMPD_Emissions_Totals.png"),
+  plot = p_totals,
+  width = 8,
+  height = 6,
+  dpi = 600
+)
+```
+
+
+# Statistical Analysis
+
+```{r statistical-analysis}
+
+
+tracts_for_anova <- tracts_with_emissions %>%
+  left_join(
+    holc_tracts_sf %>%
+      st_drop_geometry() %>%
+      group_by(GEOID) %>%
+      slice_max(pct_tract, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      dplyr::select(GEOID, holc_grade = grade),
+    by = "GEOID"
+  ) %>%
+  filter(!is.na(holc_grade)) %>%
+  mutate(
+    holc_grade = factor(holc_grade,
+                        levels = c("A", "B", "C", "D"),
+                        labels = c("Best", "Still Desirable", "Declining", "Hazardous"))
+  )
+
+# ---- Facility Count ANOVA ----
+anova_facilities <- aov(facility_count ~ holc_grade, data = tracts_for_anova)
+facilities_summary <- summary(anova_facilities)
+facilities_tukey <- TukeyHSD(anova_facilities)
+
+# ---- Income ANOVA ----
+anova_income <- aov(median_income ~ holc_grade, data = tracts_for_anova)
+income_summary <- summary(anova_income)
+income_tukey <- TukeyHSD(anova_income)
+
+# ---- SO2 ANOVA ----
+anova_so2 <- aov(total_so2 ~ holc_grade, data = tracts_for_anova)
+so2_summary <- summary(anova_so2)
+so2_tukey <- TukeyHSD(anova_so2)
+
+# ---- NOx ANOVA ----
+anova_nox <- aov(total_nox ~ holc_grade, data = tracts_for_anova)
+nox_summary <- summary(anova_nox)
+nox_tukey <- TukeyHSD(anova_nox)
+
+# ---- CO2 ANOVA ----
+anova_co2 <- aov(total_co2 ~ holc_grade, data = tracts_for_anova)
+co2_summary <- summary(anova_co2)
+co2_tukey <- TukeyHSD(anova_co2)
+
+
+print(co2_summary)
+print(nox_summary)
+print(so2_summary)
+print(income_summary)
+print(facilities_summary)
+print(income_tukey)
+print(so2_tukey)
+print(nox_tukey)
+print(co2_tukey)
+```
+
+
+
+
+# Citations
+
+Digital Scholarship Lab, University of Richmond. (n.d.). Mapping Inequality: Redlining in New Deal America. Retrieved August 1, 2024, from https://dsl.richmond.edu/panorama/redlining/
+
+

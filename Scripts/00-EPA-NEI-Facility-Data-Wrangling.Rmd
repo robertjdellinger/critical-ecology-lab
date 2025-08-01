@@ -1,0 +1,2288 @@
+---
+title: "**Data Wrangling: Facility Level Emissions from the EPA National Emissions Inventory**"
+author: "Pa-Shun Hawkins & Robert J. Dellinger"
+date: "Summer Research Project 2024"
+fontsize: 11pt  
+output:
+  tufte::tufte_html:
+    fig_caption: true
+    margin_references: true
+    tufte_features: ["fonts", "italics"]  
+    tufte_variant: "default"
+    highlight: "arrow"
+    keep_md: false
+header-includes:
+  - |
+    <style>
+      pre.sourceCode, pre code, div.sourceCode {
+        white-space: pre-wrap !important;
+        word-break: break-word !important;
+        background: transparent !important;
+      }
+    </style>
+---
+
+# Data Wrangling: Facility Level Emissions from the EPA National Emissions Inventory
+
+## Data source & methods
+
+**Source.** Annual NEI Facility Data Downloaded from U.S. Environmental Protection Agency (EPA). “National Emissions Inventory Data.” National Emissions Inventory website, February 2024. Available at EPA NEI Data ([Link](https://www.epa.gov/air-emissions-inventories)). Facility-level emissions were obtained for 1990, 1996–2001, 2002, 2005, 2008, 2011–2020. Older inventories were distributed as tab-delimited text or Access MDB files; newer inventories were distributed as CSVs. We extracted the pollutants NOX, SO2, and NH3.
+
+**Spatial filtering.** We converted latitude/longitude to a point layer in WGS84 (EPSG:4326) and retained only facilities within the seven focal states (IL, IN, KY, OH, PA, TN, WV). Observations with missing or out-of-bounds coordinates were dropped.
+
+**Units.** Emissions are reported as **tons** where provided; we carried the reported unit (`uom`) forward.
+
+**Aggregation.** For trend plots and maps, we aggregated emissions by state, year, and pollutant (sum of facility totals).
+
+# Setup Packages
+
+```{r setup-packages, include=FALSE}
+
+# Clear workspace
+rm(list = ls())
+
+# Install and load pacman
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+library(pacman)
+
+# Load core data wrangling & utility packages
+p_load(
+  tidyverse, dplyr, tidyr, purrr, stringr, readr, readxl, lubridate, janitor, glue, here,
+  fs, tibble, units, usethis, Hmisc)
+
+# Visualization packages
+p_load(
+  ggplot2, ggtext, ggrepel, ggsci, ggthemes, ggpubr, cowplot, patchwork,
+  gridExtra,scales, viridis, viridisLite, gganimate, ggimage, plotly,
+  ggstatsplot, ggsignif, gt, gtExtras, gtsummary, kableExtra, DT, 
+  scales, haven)
+
+# GIS & spatial data
+p_load(
+  sf, raster, tigris, tidycensus, ggmap, tmap, tmaptools,
+  rnaturalearth, rnaturalearthdata)
+
+# Social/environmental data packages
+p_load(
+  ipumsr, ineq, EDIutils)
+
+# Reproducibility, formatting, and environment
+p_load(
+  knitr, rmarkdown, devtools, remotes, sessioninfo, tinytex, markdown, latex2exp)
+
+# Set options
+options(tigris_use_cache = TRUE)
+options(readr.show_col_types = FALSE)
+
+# Set output paths
+output_path_images <- here("Output", "Figures")
+output_path_tables <- here("Output", "Tables")
+
+# Chunk rendering options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = FALSE,
+  out.width = "100%",
+  fig.align = "center",
+  dpi = 800
+)
+```
+
+
+# Selection Criteria for Data 
+
+```{r selection-criteria, echo=FALSE}
+
+#Get U.S. state boundaries
+states_sf <- ne_states(country = "United States of America",
+                       returnclass = "sf")
+
+# Filter for your states of interest
+states_of_interest <- c("IL", "IN", "KY", "OH", "PA", "TN", "WV")
+states_filtered <- states_sf %>% dplyr::filter(postal %in% states_of_interest)
+
+# Pollutants of Interest
+pollutants_of_interest <- c("NOX", "SO2", "NH3")
+
+```
+
+## Loading EPA NEI Facility Summary Data
+
+### EPA NEI (1990)
+
+```{r NEI-1990}
+# Load and spatially filter 1990 NEI facility data
+file_1990 <- here("Data", "EPA_NEI_Facility_Summary_Data", 
+"1990_NEI_Facility_summary", "1990FacilitySummarymade08102005.txt")
+
+nei_1990_raw <- read_delim(file_1990, delim = "\t", col_types = cols(.default = col_guess()))
+
+# Filter for relevant columns and rename them
+nei_1990_filtered_sf <- nei_1990_raw %>%
+  drop_na(LATITUDE, LONGITUDE) %>%
+  dplyr::filter(between(LATITUDE, 18, 72), 
+                between(LONGITUDE, -180, -60)) %>%
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326) %>%
+  st_filter(states_filtered, .predicate = st_within)
+
+# Clean, reshape, and standardize columns
+nei_1990_cleaned <- nei_1990_filtered_sf %>%
+  dplyr::select(-CO, -PM_CON, -PM_FIL, -PM_PRI, -PM10_FIL,
+  -PM10_PRI, -PM25_FIL, -VOC, -PM10, -PM25, -PM25_PRI) %>%
+  pivot_longer(
+    cols = c(NOX, SO2, NH3),
+    names_to = "pollutant_code",
+    values_to = "total_emissions"
+  ) %>%
+  drop_na(total_emissions) %>% filter(!is.na(total_emissions) &
+          is.finite(total_emissions) & total_emissions > 0) %>% 
+  clean_names() %>%
+  mutate(
+    emissions_uom = "TON",
+    data_set = "1990NEI",
+    year = 1996
+  ) 
+
+# Extract coordinates
+coords_1990 <- st_coordinates(nei_1990_cleaned)
+
+# Drop geometry before renaming geometry
+nei_1990 <- nei_1990_cleaned %>%
+  mutate(
+    site_latitude  = coords_1990[, "Y"],
+    site_longitude = coords_1990[, "X"]
+  ) %>%
+  st_drop_geometry() %>%  # Temporarily drop sf class
+  rename(
+    fips_state_code     = state_fips,
+    fips_code           = county_fips,
+    postal_abbreviation = state_abbreviation,
+    facility_id     = facility_id,
+    site_name           = facility_name,
+    address             = facility_address,
+    county              = county_name,
+    zip_code            = zipcode
+  ) %>%
+  mutate(
+    site_name = str_to_upper(str_trim(site_name)),
+    site_name = if_else(site_name %in% c("UNKNOWN", ""), 
+                        NA_character_, site_name),
+    city = str_to_upper(str_trim(city)),
+    city = na_if(city, ""),
+    county = str_to_upper(str_trim(county)),
+    county = str_replace(county, " Co$", " County"),
+    county = if_else(county == "" | str_detect(county, "UNKNOWN"),
+                     NA_character_, county),
+    state = na_if(str_trim(state), ""),
+    zip_code  = str_trim(zip_code),
+    zip_code  = na_if(zip_code, ""),
+    zip_code  = na_if(zip_code, "00000"),
+    zip_code = str_extract(zip_code, "\\d{5}"),  
+    zip_code = na_if(zip_code, "00000")   
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  bind_cols(geometry = st_geometry(nei_1990_cleaned)) %>%
+  st_as_sf()
+
+print(nei_1990)
+```
+
+### EPA NEI (1996)
+
+```{r NEI-1996}
+file_1996 <- here("Data", "EPA_NEI_Facility_Summary_Data", 
+                          "1996_NEI_Facility_summary", "1996FacilitySummarymade08102005.txt")
+
+nei_1996_raw <- read_delim(file_1996, delim = "\t", col_types = cols(.default = col_guess()))
+
+nei_1996_filtered_sf <- nei_1996_raw %>%
+  drop_na(LATITUDE, LONGITUDE) %>%
+  dplyr::filter(between(LATITUDE, 18, 72), 
+                between(LONGITUDE, -180, -60)) %>%
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326) %>%
+  st_join(states_filtered %>% dplyr::select(woe_name), 
+          join = st_within, left = FALSE) %>%
+  rename(woe_state = woe_name)  %>%
+  st_filter(states_filtered, .predicate = st_within)
+
+# Clean, reshape, and standardize columns
+nei_1996_cleaned <- nei_1996_filtered_sf %>%
+  dplyr::select(-CO, -PM_CON, -PM_FIL, -PM_PRI, -PM10_FIL, 
+                -PM10_PRI, -PM25_FIL, -VOC, -PM10, -PM25, -PM25_PRI) %>%
+  pivot_longer(
+    cols = c(NOX, SO2, NH3),
+    names_to = "pollutant_code",
+    values_to = "total_emissions"
+  ) %>%
+  drop_na(total_emissions) %>% filter(!is.na(total_emissions) &
+          is.finite(total_emissions) & total_emissions > 0) %>% 
+  clean_names() %>%
+  mutate(
+    emissions_uom = "TON",
+    data_set = "1996NEI",
+    year = 1996
+  ) 
+
+# Extract coordinates
+coords_1996 <- st_coordinates(nei_1996_cleaned)
+
+# Drop geometry before renaming
+nei_1996 <- nei_1996_cleaned %>%
+  mutate(
+    site_latitude  = coords_1996[, "Y"],
+    site_longitude = coords_1996[, "X"]
+  ) %>%
+  st_drop_geometry() %>%  # Temporarily drop sf class
+  rename(
+    fips_state_code     = state_fips,
+    fips_code           = county_fips,
+    postal_abbreviation = state_abbreviation,
+    facility_id     = facility_id,
+    site_name           = facility_name,
+    address             = facility_address,
+    county              = county_name,
+    zip_code            = zipcode
+  ) %>%
+  mutate(
+    site_name = str_to_upper(str_trim(site_name)),
+    site_name = if_else(site_name %in% c("UNKNOWN", ""),
+                        NA_character_, site_name),
+    city = str_to_upper(str_trim(city)),
+    city = na_if(city, ""),
+    county = str_to_upper(str_trim(county)),
+    county = str_replace(county, " Co$", " County"),
+    county = if_else(county == "" | str_detect(county, "UNKNOWN"),
+                     NA_character_, county),
+    state = na_if(str_trim(state), ""),
+    zip_code  = str_trim(zip_code),
+    zip_code  = na_if(zip_code, ""),
+    zip_code  = na_if(zip_code, "00000"),
+    zip_code = str_extract(zip_code, "\\d{5}"),
+    zip_code = na_if(zip_code, "00000") 
+  ) %>%
+   dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  bind_cols(geometry = st_geometry(nei_1996_cleaned)) %>%
+  st_as_sf()
+
+print(nei_1996)
+  
+```
+
+
+### EPA NEI (1997)
+
+```{r NEI-1997}
+file_1997 <- here("Data", "EPA_NEI_Facility_Summary_Data", 
+                          "1997_NEI_Facility_summary", "1997FacilitySummarymade08102005.txt")
+
+nei_1997_raw <- read_delim(file_1997, delim = "\t", col_types = cols(.default = col_guess()))
+
+nei_1997_filtered_sf <- nei_1997_raw %>%
+  drop_na(LATITUDE, LONGITUDE) %>%
+  dplyr::filter(between(LATITUDE, 18, 72),
+                between(LONGITUDE, -180, -60)) %>% 
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326) %>%
+  st_join(states_filtered %>% dplyr::select(woe_name),
+          join = st_within, left = FALSE) %>%
+  rename(woe_state = woe_name)  %>%
+  st_filter(states_filtered, .predicate = st_within)
+
+# Clean, reshape, and standardize columns
+nei_1997_cleaned <- nei_1997_filtered_sf %>%
+  dplyr::select(-CO, -PM_CON, -PM_FIL, -PM_PRI,
+  -PM10_FIL, -PM10_PRI, -PM25_FIL, -VOC, -PM10, -PM25, -PM25_PRI) %>%
+  pivot_longer(
+    cols = c(NOX, SO2, NH3),
+    names_to = "pollutant_code",
+    values_to = "total_emissions"
+  ) %>%
+  drop_na(total_emissions) %>% filter(!is.na(total_emissions) &
+          is.finite(total_emissions) & total_emissions > 0) %>% 
+  clean_names() %>%
+  mutate(
+    emissions_uom = "TON",
+    data_set = "1997NEI",
+    year = 1997
+  ) 
+
+# Extract coordinates
+coords_1997 <- st_coordinates(nei_1997_cleaned)
+
+# Drop geometry before renaming
+nei_1997 <- nei_1997_cleaned %>%
+  mutate(
+    site_latitude  = coords_1997[, "Y"],
+    site_longitude = coords_1997[, "X"]
+  ) %>%
+  st_drop_geometry() %>%  # Temporarily drop sf class
+  rename(
+    fips_state_code     = state_fips,
+    fips_code           = county_fips,
+    postal_abbreviation = state_abbreviation,
+    facility_id     = facility_id,
+    site_name           = facility_name,
+    address             = facility_address,
+    county              = county_name,
+    zip_code            = zipcode
+  ) %>%
+  mutate(
+    site_name = str_to_upper(str_trim(site_name)),
+    site_name = if_else(site_name %in% c("UNKNOWN", ""),
+                        NA_character_, site_name),
+    city = str_to_upper(str_trim(city)),
+    city = na_if(city, ""),
+    county = str_to_upper(str_trim(county)),
+    county = str_replace(county, " Co$", " County"),
+    county = if_else(county == "" | str_detect(county, "UNKNOWN"),
+                     NA_character_, county),
+    state = na_if(str_trim(state), ""),
+    zip_code  = str_trim(zip_code),
+    zip_code  = na_if(zip_code, ""),
+    zip_code  = na_if(zip_code, "00000"),
+    zip_code = str_extract(zip_code, "\\d{5}"),
+    zip_code = na_if(zip_code, "00000") 
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  bind_cols(geometry = st_geometry(nei_1997_cleaned)) %>%
+  st_as_sf()
+
+print(nei_1997)
+  
+```
+### EPA NEI (1998)
+
+```{r NEI-1998}
+file_1998 <- here("Data", "EPA_NEI_Facility_Summary_Data", 
+                          "1998_NEI_Facility_summary", "1998FacilitySummarymade08102005.txt")
+
+nei_1998_raw <- read_delim(file_1998, delim = "\t", col_types = cols(.default = col_guess()))
+
+nei_1998_filtered_sf <- nei_1998_raw %>%
+  drop_na(LATITUDE, LONGITUDE) %>%
+  dplyr::filter(between(LATITUDE, 18, 72), 
+                between(LONGITUDE, -180, -60)) %>% 
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326) %>%
+  st_join(states_filtered %>% dplyr::select(woe_name), 
+          join = st_within, left = FALSE) %>%
+  rename(woe_state = woe_name)  %>%
+  st_filter(states_filtered, .predicate = st_within)
+
+# Clean, reshape, and standardize columns
+nei_1998_cleaned <- nei_1998_filtered_sf %>%
+  dplyr::select(-CO, -PM_CON, -PM_FIL, -PM_PRI,
+  -PM10_FIL, -PM10_PRI, -PM25_FIL, -VOC, -PM10, -PM25, -PM25_PRI) %>%
+  pivot_longer(
+    cols = c(NOX, SO2, NH3),
+    names_to = "pollutant_code",
+    values_to = "total_emissions"
+  ) %>%
+  drop_na(total_emissions) %>% filter(!is.na(total_emissions) &
+          is.finite(total_emissions) & total_emissions > 0) %>% 
+  clean_names() %>%
+  mutate(
+    emissions_uom = "TON",
+    data_set = "1998NEI",
+    year = 1998
+  ) 
+
+# Extract coordinates
+coords_1998 <- st_coordinates(nei_1998_cleaned)
+
+# Drop geometry before renaming
+nei_1998 <- nei_1998_cleaned %>%
+  mutate(
+    site_latitude  = coords_1998[, "Y"],
+    site_longitude = coords_1998[, "X"]
+  ) %>%
+  st_drop_geometry() %>%  # Temporarily drop sf class
+  rename(
+    fips_state_code     = state_fips,
+    fips_code           = county_fips,
+    postal_abbreviation = state_abbreviation,
+    facility_id     = facility_id,
+    site_name           = facility_name,
+    address             = facility_address,
+    county              = county_name,
+    zip_code            = zipcode
+  ) %>%
+  mutate(
+    site_name = str_to_upper(str_trim(site_name)),
+    site_name = if_else(site_name %in% c("UNKNOWN", ""),
+                        NA_character_, site_name),
+    city = str_to_upper(str_trim(city)),
+    city = na_if(city, ""),
+    county = str_to_upper(str_trim(county)),
+    county = str_replace(county, " Co$", " County"),
+    county = if_else(county == "" | str_detect(county, "UNKNOWN"),
+                     NA_character_, county),
+    state = na_if(str_trim(state), ""),
+    zip_code  = str_trim(zip_code),
+    zip_code  = na_if(zip_code, ""),
+    zip_code  = na_if(zip_code, "00000"),
+    zip_code = str_extract(zip_code, "\\d{5}"),
+    zip_code = na_if(zip_code, "00000") 
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  bind_cols(geometry = st_geometry(nei_1998_cleaned)) %>%
+  st_as_sf()
+
+print(nei_1998)
+  
+```
+
+
+### EPA NEI (1999)
+
+```{r NEI-1999}
+file_1999 <- here("Data", "EPA_NEI_Facility_Summary_Data", 
+                          "1999_NEI_Facility_summary", "1999FacilitySummarymade08102005.txt")
+
+nei_1999_raw <- read_delim(file_1999, delim = "\t", col_types = cols(.default = col_guess()))
+
+nei_1999_filtered_sf <- nei_1999_raw %>%
+  drop_na(LATITUDE, LONGITUDE) %>%
+  dplyr::filter(between(LATITUDE, 18, 72),
+                between(LONGITUDE, -180, -60)) %>% 
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326) %>%
+  st_join(states_filtered %>% dplyr::select(woe_name),
+          join = st_within, left = FALSE) %>%
+  rename(woe_state = woe_name)  %>%
+  st_filter(states_filtered, .predicate = st_within)
+
+# Clean, reshape, and standardize columns
+nei_1999_cleaned <- nei_1999_filtered_sf %>%
+  dplyr::select(-CO, -PM_CON, -PM_FIL, -PM_PRI,
+  -PM10_FIL, -PM10_PRI, -PM25_FIL, -VOC, -PM10, -PM25, -PM25_PRI) %>%
+  pivot_longer(
+    cols = c(NOX, SO2, NH3),
+    names_to = "pollutant_code",
+    values_to = "total_emissions"
+  ) %>%
+  drop_na(total_emissions) %>% filter(!is.na(total_emissions) &
+          is.finite(total_emissions) & total_emissions > 0) %>% 
+  clean_names() %>%
+  mutate(
+    emissions_uom = "TON",
+    data_set = "1999NEI",
+    year = 1999
+  ) 
+
+# Extract coordinates
+coords_1999 <- st_coordinates(nei_1999_cleaned)
+
+# Drop geometry before renaming
+nei_1999 <- nei_1999_cleaned %>%
+  mutate(
+    site_latitude  = coords_1999[, "Y"],
+    site_longitude = coords_1999[, "X"]
+  ) %>%
+  st_drop_geometry() %>%  # Temporarily drop sf class
+  rename(
+    fips_state_code     = state_fips,
+    fips_code           = county_fips,
+    postal_abbreviation = state_abbreviation,
+    facility_id     = facility_id,
+    site_name           = facility_name,
+    address             = facility_address,
+    county              = county_name,
+    zip_code            = zipcode
+  ) %>%
+  mutate(
+    site_name = str_to_upper(str_trim(site_name)),
+    site_name = if_else(site_name %in% c("UNKNOWN", ""),
+                        NA_character_, site_name),
+    city = str_to_upper(str_trim(city)),
+    city = na_if(city, ""),
+    county = str_to_upper(str_trim(county)),
+    county = str_replace(county, " Co$", " County"),
+    county = if_else(county == "" | str_detect(county, "UNKNOWN"), NA_character_, county),
+    state = na_if(str_trim(state), ""),
+    zip_code  = str_trim(zip_code),
+    zip_code  = na_if(zip_code, ""),
+    zip_code  = na_if(zip_code, "00000"),
+    zip_code = str_extract(zip_code, "\\d{5}"),
+    zip_code = na_if(zip_code, "00000") 
+  ) %>%
+   dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  bind_cols(geometry = st_geometry(nei_1999_cleaned)) %>%
+  st_as_sf()
+
+print(nei_1999)
+  
+```
+
+
+### EPA NEI (2000)
+
+```{r NEI-2000}
+file_2000 <- here("Data", "EPA_NEI_Facility_Summary_Data", 
+                          "2000_NEI_Facility_summary", "2000FacilitySummarymade08102005.txt")
+
+nei_2000_raw <- read_delim(file_2000, delim = "\t", col_types = cols(.default = col_guess()))
+
+nei_2000_filtered_sf <- nei_2000_raw %>%
+  drop_na(LATITUDE, LONGITUDE) %>%
+  dplyr::filter(between(LATITUDE, 18, 72),
+                between(LONGITUDE, -180, -60)) %>% 
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326) %>%
+  st_join(states_filtered %>%  dplyr::select(woe_name),
+          join = st_within, left = FALSE) %>%
+  rename(woe_state = woe_name)  %>%
+  st_filter(states_filtered, .predicate = st_within)
+
+# Clean, reshape, and standardize columns
+nei_2000_cleaned <- nei_2000_filtered_sf %>%
+   dplyr::select(-CO, -PM_CON, -PM_FIL, -PM_PRI,
+   -PM10_FIL, -PM10_PRI, -PM25_FIL, -VOC, -PM10, -PM25, -PM25_PRI) %>%
+  pivot_longer(
+    cols = c(NOX, SO2, NH3),
+    names_to = "pollutant_code",
+    values_to = "total_emissions"
+  ) %>%
+  drop_na(total_emissions) %>% filter(!is.na(total_emissions) &
+          is.finite(total_emissions) & total_emissions > 0) %>% 
+  clean_names() %>%
+  mutate(
+    emissions_uom = "TON",
+    data_set = "2000NEI",
+    year = 2000
+  ) 
+
+# Extract coordinates
+coords_2000 <- st_coordinates(nei_2000_cleaned)
+
+# Drop geometry before renaming
+nei_2000 <- nei_2000_cleaned %>%
+  mutate(
+    site_latitude  = coords_2000[, "Y"],
+    site_longitude = coords_2000[, "X"]
+  ) %>%
+  st_drop_geometry() %>%  # Temporarily drop sf class
+  rename(
+    fips_state_code     = state_fips,
+    fips_code           = county_fips,
+    postal_abbreviation = state_abbreviation,
+    facility_id     = facility_id,
+    site_name           = facility_name,
+    address             = facility_address,
+    county              = county_name,
+    zip_code            = zipcode
+  ) %>%
+  mutate(
+    site_name = str_to_upper(str_trim(site_name)),
+    site_name = if_else(site_name %in% c("UNKNOWN", ""),
+                        NA_character_, site_name),
+    city = str_to_upper(str_trim(city)),
+    city = na_if(city, ""),
+    county = str_to_upper(str_trim(county)),
+    county = str_replace(county, " Co$", " County"),
+    county = if_else(county == "" | str_detect(county, "UNKNOWN"),
+                     NA_character_, county),
+    state = na_if(str_trim(state), ""),
+    zip_code  = str_trim(zip_code),
+    zip_code  = na_if(zip_code, ""),
+    zip_code  = na_if(zip_code, "00000"),
+    zip_code = str_extract(zip_code, "\\d{5}"),
+    zip_code = na_if(zip_code, "00000") 
+  ) %>%
+   dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  bind_cols(geometry = st_geometry(nei_2000_cleaned)) %>%
+  st_as_sf()
+
+print(nei_2000)
+  
+```
+
+
+
+### EPA NEI (2001)
+
+```{r NEI-2001}
+file_2001 <- here("Data", "EPA_NEI_Facility_Summary_Data", 
+                          "2001_NEI_Facility_summary", "2001FacilitySummarymade08312005.txt")
+
+nei_2001_raw <- read_delim(file_2001, delim = "\t", col_types = cols(.default = col_guess()))
+
+nei_2001_filtered_sf <- nei_2001_raw %>%
+  drop_na(LATITUDE, LONGITUDE) %>%
+  dplyr::filter(between(LATITUDE, 18, 72), 
+                between(LONGITUDE, -180, -60)) %>% 
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326) %>%
+  st_join(states_filtered %>%  dplyr::select(woe_name),
+          join = st_within, left = FALSE) %>%
+  rename(woe_state = woe_name)  %>%
+  st_filter(states_filtered, .predicate = st_within)
+
+# Clean, reshape, and standardize columns
+nei_2001_cleaned <- nei_2001_filtered_sf %>%
+   dplyr::select(-CO, -PM_CON, -PM_FIL, -PM_PRI,
+  -PM10_FIL, -PM10_PRI, -PM25_FIL, -VOC, -PM10, -PM25, -PM25_PRI) %>%
+  pivot_longer(
+    cols = c(NOX, SO2, NH3),
+    names_to = "pollutant_code",
+    values_to = "total_emissions"
+  ) %>%
+  drop_na(total_emissions) %>% filter(!is.na(total_emissions) &
+          is.finite(total_emissions) & total_emissions > 0) %>% 
+  clean_names() %>%
+  mutate(
+    emissions_uom = "TON",
+    data_set = "2001NEI",
+    year = 2001
+  ) 
+
+# Extract coordinates
+coords_2001 <- st_coordinates(nei_2001_cleaned)
+
+# Drop geometry before renaming
+nei_2001 <- nei_2001_cleaned %>%
+  mutate(
+    site_latitude  = coords_2001[, "Y"],
+    site_longitude = coords_2001[, "X"]
+  ) %>%
+  st_drop_geometry() %>%  # Temporarily drop sf class
+  rename(
+    fips_state_code     = state_fips,
+    fips_code           = county_fips,
+    postal_abbreviation = state_abbreviation,
+    facility_id     = facility_id,
+    site_name           = facility_name,
+    address             = facility_address,
+    county              = county_name,
+    zip_code            = zipcode
+  ) %>%
+  mutate(
+    site_name = str_to_upper(str_trim(site_name)),
+    site_name = if_else(site_name %in% c("UNKNOWN", ""),
+                        NA_character_, site_name),
+    city = str_to_upper(str_trim(city)),
+    city = na_if(city, ""),
+    county = str_to_upper(str_trim(county)),
+    county = str_replace(county, " Co$", " County"),
+    county = if_else(county == "" | str_detect(county, "UNKNOWN"),
+                     NA_character_, county),
+    state = na_if(str_trim(state), ""),
+    zip_code  = str_trim(zip_code),
+    zip_code  = na_if(zip_code, ""),
+    zip_code  = na_if(zip_code, "00000"),
+    zip_code = str_extract(zip_code, "\\d{5}"),
+    zip_code = na_if(zip_code, "00000") 
+  ) %>%
+   dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  bind_cols(geometry = st_geometry(nei_2001_cleaned)) %>%
+  st_as_sf()
+
+print(nei_2001)
+  
+```
+
+
+### EPA NEI (2002)
+
+```{r NEI-2002}
+file_2002 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2002_NEI_Facility_summary",
+                  "2002_NEI_v3_Facility_Sums_Sep10_2007.mdb")
+
+pollutant_cols <- c("NOX","SO2","NH3")
+
+tbl_2002 <- Hmisc::mdb.get(file_2002, stringsAsFactors = FALSE)$Facility_Pollutant_091007 %>%
+  as_tibble() %>%
+  # strip ALL labels first
+  mutate(across(where(haven::is.labelled), haven::zap_label)) %>%
+  # make sure coords are numeric
+  mutate(across(c(LATITUDE, LONGITUDE), as.numeric)) %>%
+  # make sure pollutants are plain numeric too
+  mutate(across(all_of(pollutant_cols), as.numeric))
+
+nei_2002_filtered_sf <- tbl_2002 %>%
+  drop_na(LATITUDE, LONGITUDE) %>%
+  filter(
+    between(LATITUDE, 18, 72),
+    between(LONGITUDE, -180, -60)
+  ) %>%
+  st_as_sf(coords = c("LONGITUDE","LATITUDE"), crs = 4326) %>%
+  st_filter(states_filtered, .predicate = st_within)
+
+nei_2002_cleaned <- nei_2002_filtered_sf %>%
+  # pollutants are already numeric now
+  dplyr::select(ST.FIPS:EPA.REGION, all_of(pollutant_cols)) %>%
+  pivot_longer(
+    cols = all_of(pollutant_cols),
+    names_to = "pollutant_code",
+    values_to = "total_emissions"
+  ) %>%
+  drop_na(total_emissions) %>%
+  filter(is.finite(total_emissions), total_emissions > 0) %>%
+  janitor::clean_names() %>%
+  mutate(
+    emissions_uom = "TON",
+    data_set      = "2002NEI",
+    year          = 2002
+  )
+
+coords_2002 <- sf::st_coordinates(nei_2002_cleaned)
+
+nei_2002 <- nei_2002_cleaned %>%
+  mutate(
+    site_latitude  = coords_2002[, "Y"],
+    site_longitude = coords_2002[, "X"]
+  ) %>%
+  st_drop_geometry() %>%
+  rename(
+    fips_state_code     = st_fips,
+    fips_code           = cty_fips,
+    postal_abbreviation = st_abbr,
+    facility_id         = state_facility_identifier,
+    site_name           = facility_name,
+    address             = location_address,
+    county              = county_name,
+    zip_code            = zipcode
+  ) %>%
+  mutate(
+    site_name = str_to_upper(str_trim(site_name)) %>% na_if("UNKNOWN"),
+    city      = str_to_upper(str_trim(city)) %>% na_if(""),
+    county    = str_to_upper(str_trim(county)) %>%
+                  str_replace(" Co$", " County") %>%
+                  na_if("UNKNOWN"),
+    state     = na_if(str_trim(state), ""),
+    zip_code  = str_extract(str_trim(zip_code), "\\d{5}") %>% na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code, fips_code, postal_abbreviation, county,
+    facility_id, site_name, address, zip_code, city,
+    site_latitude, site_longitude,
+    pollutant_code, total_emissions, emissions_uom, data_set, year
+  ) %>%
+  bind_cols(geometry = sf::st_geometry(nei_2002_cleaned)) %>%
+  sf::st_as_sf()
+
+print(nei_2002)
+```
+
+
+### EPA NEI (2005)
+
+```{r NEI-2005}
+file_2005 <- here("Data","EPA_NEI_Facility_Summary_Data",
+"2005_NEI_Facility_summary", "Facility_Summary_2005_V2NEW060809.mdb")
+
+tbl_2005 <- Hmisc::mdb.get(file_2005, tables="Facility Summary", stringsAsFactors = FALSE) %>% 
+  as_tibble() 
+
+pollutant_cols <- c("NOX","SO2","NH3")
+
+nei_2005_filtered_sf <- tbl_2005 %>% 
+  rename(latitude  = Lattitude,          # fix the typo first
+         longitude = Longitude) %>% 
+  mutate(across(all_of(pollutant_cols), haven::zap_label),
+         across(c(latitude, longitude), as.numeric)) %>% 
+  drop_na(latitude, longitude) %>% 
+  filter(between(latitude , 18 , 72),
+         between(longitude, -180, -60)) %>% 
+  st_as_sf(coords = c("longitude","latitude"), crs = 4326) %>% 
+  st_filter(states_filtered, .predicate = st_within)
+
+coords_2005 <- st_coordinates(nei_2005_filtered_sf)
+
+# Clean & pivot (tibble)
+nei_2005_cleaned <- nei_2005_filtered_sf %>% 
+  mutate(site_latitude  = coords_2005[, "Y"],
+         site_longitude = coords_2005[, "X"]) %>% 
+  dplyr::select(State...County.FIPS:SIC.Description,  
+                site_latitude, site_longitude,
+                all_of(pollutant_cols)) %>% 
+  st_drop_geometry() %>% 
+  pivot_longer(cols      = all_of(pollutant_cols),
+               names_to  = "pollutant_code",
+               values_to = "total_emissions") %>% 
+  clean_names() %>%  # now you have snake_case names
+  mutate(
+    zip_code_raw = stringr::str_extract(address, "\\d{5}(?:-\\d{4})?"),
+    zip_code     = stringr::str_sub(zip_code_raw, 1, 5)
+  ) %>% 
+  drop_na(total_emissions) %>% filter(!is.na(total_emissions) &
+          is.finite(total_emissions) & total_emissions > 0) %>%  
+  mutate(
+    emissions_uom = "TON",
+    data_set      = "2005NEI",
+    year          = 2005
+  )
+
+nei_2005 <- nei_2005_cleaned %>% 
+  mutate(
+    fips_full = stringr::str_pad(as.character(state_county_fips),
+                                 5, pad = "0"),
+    fips_state_code  = substr(fips_full, 1, 2),
+    fips_code        = substr(fips_full, 3, 5)
+  ) %>% 
+  rename(
+    postal_abbreviation = st,               # two-letter state
+    county              = county_name,
+    facility_id         = facility_site_id, # choose this as unique facility key
+    site_name           = facility_name
+  ) %>% 
+  mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)),
+    site_name = dplyr::na_if(site_name, "UNKNOWN"),
+    city = dplyr::na_if(stringr::str_to_upper(stringr::str_trim(city)),
+                        ""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)),
+    county    = stringr::str_replace(county, " Co$", " County"),
+    county    = dplyr::if_else(stringr::str_detect(county, "UNKNOWN") |
+                                 county == "", NA_character_, county),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}"),
+    zip_code  = dplyr::na_if(zip_code, "00000")
+  ) %>% 
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  st_as_sf(coords = c("site_longitude","site_latitude"),
+           remove = FALSE, crs = 4326)
+
+print(nei_2005)
+```
+
+
+### EPA NEI (2008)
+
+```{r NEI-2008}
+file_2008 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2008_NEI_Facility_summary",
+                  "2008neiv3_facility.csv")
+
+nei_2008_raw <- readr::read_csv(file_2008, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2008_filtered_sf <- nei_2008_raw %>%
+  dplyr::filter(pollutant_cd %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(latitude_msr),
+    longitude_msr = as.numeric(longitude_msr)
+  ) %>%
+  tidyr::drop_na(latitude_msr, longitude_msr) %>%
+  dplyr::filter(
+    dplyr::between(latitude_msr , 18 , 72),
+    dplyr::between(longitude_msr, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("longitude_msr","latitude_msr"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(total_emissions) %>% filter(!is.na(total_emissions) &
+          is.finite(total_emissions) & total_emissions > 0)
+
+coords_2008 <- sf::st_coordinates(nei_2008_filtered_sf)
+
+nei_2008 <- nei_2008_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2008[, "Y"],
+    site_longitude = coords_2008[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  dplyr::mutate(
+    fips_full        = stringr::str_pad(as.character(state_and_county_fips_code), 5, pad = "0"),
+    fips_state_code  = substr(fips_full, 1, 2),
+    fips_code        = substr(fips_full, 3, 5),
+    # keep the unit you got (typically "TON")
+    emissions_uom    = uom,
+    data_set         = "2008NEI",
+    year             = 2008
+  ) %>%
+  dplyr::rename(
+    postal_abbreviation = st_usps_cd,
+    county              = county_name,
+    facility_id         = eis_facility_site_id,
+    site_name           = facility_site_name,
+    address             = location_address_text,
+    city                = locality,
+    zip_code            = address_postal_code,
+    pollutant_code      = pollutant_cd
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)),
+    site_name = dplyr::na_if(site_name, "UNKNOWN"),
+    city = dplyr::na_if(stringr::str_to_upper(stringr::str_trim(city)),
+                        ""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)),
+    county    = stringr::str_replace(county, " Co$", " County"),
+    county    = dplyr::if_else(stringr::str_detect(county, "UNKNOWN") | county == "",
+                               NA_character_, county),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}"),
+    zip_code  = dplyr::na_if(zip_code, "00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"),
+           remove = FALSE, crs = 4326)
+
+print(nei_2008)
+```
+
+### EPA NEI (2011)
+
+```{r NEI-2011}
+file_2011 <- here("Data","EPA_NEI_Facility_Summary_Data",
+"2011_NEI_Facility_summary",
+"2011neiv2_facility.csv")
+
+nei_2011_raw <- readr::read_csv(file_2011, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2011_filtered_sf <- nei_2011_raw %>%
+  dplyr::filter(pollutant_cd %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(latitude_msr),
+    longitude_msr = as.numeric(longitude_msr)
+  ) %>%
+  tidyr::drop_na(latitude_msr, longitude_msr, total_emissions) %>%
+  dplyr::filter(
+    dplyr::between(latitude_msr , 18 , 72),
+    dplyr::between(longitude_msr, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("longitude_msr","latitude_msr"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>%
+  filter(!is.na(total_emissions) & is.finite(total_emissions) &
+           total_emissions > 0)
+
+coords_2011 <- sf::st_coordinates(nei_2011_filtered_sf)
+
+nei_2011 <- nei_2011_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2011[, "Y"],
+    site_longitude = coords_2011[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  dplyr::mutate(
+    fips_full        = stringr::str_pad(as.character(state_and_county_fips_code), 5, pad = "0"),
+    fips_state_code  = substr(fips_full, 1, 2),
+    fips_code        = substr(fips_full, 3, 5),
+    emissions_uom    = uom,
+    data_set         = "2011NEI",
+    year             = 2011
+  ) %>%
+  dplyr::rename(
+    postal_abbreviation = st_usps_cd,
+    county              = county_name,
+    facility_id         = eis_facility_site_id,
+    site_name           = facility_site_name,
+    address             = location_address_text,
+    city                = locality,
+    zip_code            = address_postal_code,
+    pollutant_code      = pollutant_cd
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)),
+    site_name = dplyr::na_if(site_name, "UNKNOWN"),
+    city      = dplyr::na_if(stringr::str_to_upper(stringr::str_trim(city)), ""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)),
+    county    = stringr::str_replace(county, " Co$", " County"),
+    county    = dplyr::if_else(stringr::str_detect(county, "UNKNOWN") |
+                                 county == "", NA_character_, county),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}"),
+    zip_code  = dplyr::na_if(zip_code, "00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"),
+           remove = FALSE, crs = 4326)
+
+print(nei_2011)
+```
+
+
+
+### EPA NEI (2012)
+
+```{r NEI-2012}
+
+file_2012 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2012_NEI_Facility_summary",
+                  "2012_NEI_Facility_summary.csv")
+
+
+nei_2012_raw <- readr::read_csv(file_2012, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2012_filtered_sf <- nei_2012_raw %>%
+  dplyr::filter(`pollutant code` %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(`site latitude`),
+    longitude_msr = as.numeric(`site longitude`)
+  ) %>%
+  tidyr::drop_na(`site latitude`, `site longitude`, `total emissions`) %>%
+  dplyr::filter(
+    dplyr::between(`site latitude`, 18 , 72),
+    dplyr::between(`site longitude`, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("site longitude","site latitude"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(`total emissions`)
+
+coords_2012 <- sf::st_coordinates(nei_2012_filtered_sf)
+
+nei_2012 <- nei_2012_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2012[, "Y"],
+    site_longitude = coords_2012[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  # create *new* fips columns with unique names to avoid collisions
+  dplyr::mutate(
+    fips_full_calc       = stringr::str_pad(as.character(`fips code`), 5, pad = "0"),
+    fips_state_code_calc = substr(fips_full_calc, 1, 2),
+    fips_code_calc       = substr(fips_full_calc, 3, 5),
+    data_set             = "2012NEI",
+    year                 = 2012
+  ) %>%
+  janitor::clean_names() %>%
+  # now rename using the **cleaned** names
+  dplyr::rename(
+    facility_id         = eis_facility_id,
+    pollutant_code      = pollutant_code  # already correct, kept for clarity
+  ) %>%
+  # carry the calculated fips columns to the standard names
+  dplyr::mutate(
+    fips_state_code = fips_state_code_calc,
+    fips_code       = fips_code_calc
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)) %>% dplyr::na_if("UNKNOWN"),
+    city      = stringr::str_to_upper(stringr::str_trim(city)) %>% dplyr::na_if(""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)) %>%
+                  stringr::str_replace(" Co$", " County") %>%
+                  dplyr::na_if("UNKNOWN"),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}") %>% dplyr::na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"), remove = FALSE, crs = 4326)
+
+print(nei_2012)
+```
+
+---
+
+### EPA NEI (2013)
+
+```{r NEI-2013}
+file_2013 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2013_NEI_Facility_summary",
+                  "2013_NEI_Facility_summary.csv")
+
+nei_2013_raw <- readr::read_csv(file_2013, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2013_filtered_sf <- nei_2013_raw %>%
+  dplyr::filter(`pollutant code` %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(`site latitude`),
+    longitude_msr = as.numeric(`site longitude`)
+  ) %>%
+  tidyr::drop_na(`site latitude`, `site longitude`, `total emissions`) %>%
+  dplyr::filter(
+    dplyr::between(`site latitude`, 18 , 72),
+    dplyr::between(`site longitude`, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("site longitude","site latitude"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(`total emissions`)
+
+coords_2013 <- sf::st_coordinates(nei_2013_filtered_sf)
+
+nei_2013 <- nei_2013_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2013[, "Y"],
+    site_longitude = coords_2013[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  # create *new* fips columns with unique names to avoid collisions
+  dplyr::mutate(
+    fips_full_calc       = stringr::str_pad(as.character(`fips code`), 5, pad = "0"),
+    fips_state_code_calc = substr(fips_full_calc, 1, 2),
+    fips_code_calc       = substr(fips_full_calc, 3, 5),
+    data_set             = "2013NEI",
+    year                 = 2013
+  ) %>%
+  janitor::clean_names() %>%
+  # now rename using the **cleaned** names
+  dplyr::rename(
+    facility_id         = eis_facility_id,
+    pollutant_code      = pollutant_code  # already correct, kept for clarity
+  ) %>%
+  # carry the calculated fips columns to the standard names
+  dplyr::mutate(
+    fips_state_code = fips_state_code_calc,
+    fips_code       = fips_code_calc
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)) %>% dplyr::na_if("UNKNOWN"),
+    city      = stringr::str_to_upper(stringr::str_trim(city)) %>% dplyr::na_if(""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)) %>%
+                  stringr::str_replace(" Co$", " County") %>%
+                  dplyr::na_if("UNKNOWN"),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}") %>% dplyr::na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"), remove = FALSE, crs = 4326)
+
+print(nei_2013)
+```
+
+---
+
+### EPA NEI (2014)
+
+```{r NEI-2014}
+file_2014 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2014_NEI_Facility_summary",
+                  "2014_NEI_Facility_summary.csv")
+
+nei_2014_raw <- readr::read_csv(file_2014, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2014_filtered_sf <- nei_2014_raw %>%
+  dplyr::filter(`pollutant code` %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(`site latitude`),
+    longitude_msr = as.numeric(`site longitude`)
+  ) %>%
+  tidyr::drop_na(`site latitude`, `site longitude`, `total emissions`) %>%
+  dplyr::filter(
+    dplyr::between(`site latitude`, 18 , 72),
+    dplyr::between(`site longitude`, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("site longitude","site latitude"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(`total emissions`)
+
+coords_2014 <- sf::st_coordinates(nei_2014_filtered_sf)
+
+nei_2014 <- nei_2014_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2014[, "Y"],
+    site_longitude = coords_2014[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  # create *new* fips columns with unique names to avoid collisions
+  dplyr::mutate(
+    fips_full_calc       = stringr::str_pad(as.character(`fips code`), 5, pad = "0"),
+    fips_state_code_calc = substr(fips_full_calc, 1, 2),
+    fips_code_calc       = substr(fips_full_calc, 3, 5),
+    data_set             = "2014NEI",
+    year                 = 2014
+  ) %>%
+  janitor::clean_names() %>%
+  # now rename using the **cleaned** names
+  dplyr::rename(
+    facility_id         = eis_facility_id,
+    pollutant_code      = pollutant_code  # already correct, kept for clarity
+  ) %>%
+  # carry the calculated fips columns to the standard names
+  dplyr::mutate(
+    fips_state_code = fips_state_code_calc,
+    fips_code       = fips_code_calc
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)) %>% dplyr::na_if("UNKNOWN"),
+    city      = stringr::str_to_upper(stringr::str_trim(city)) %>% dplyr::na_if(""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)) %>%
+                  stringr::str_replace(" Co$", " County") %>%
+                  dplyr::na_if("UNKNOWN"),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}") %>% dplyr::na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"), remove = FALSE, crs = 4326)
+
+print(nei_2014)
+```
+
+---
+
+### EPA NEI (2015)
+
+```{r NEI-2015}
+file_2015 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2015_NEI_Facility_summary",
+                  "2015_NEI_Facility_summary.csv")
+
+nei_2015_raw <- readr::read_csv(file_2015, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2015_filtered_sf <- nei_2015_raw %>%
+  dplyr::filter(`pollutant code` %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(`site latitude`),
+    longitude_msr = as.numeric(`site longitude`)
+  ) %>%
+  tidyr::drop_na(`site latitude`, `site longitude`, `total emissions`) %>%
+  dplyr::filter(
+    dplyr::between(`site latitude`, 18 , 72),
+    dplyr::between(`site longitude`, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("site longitude","site latitude"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(`total emissions`)
+
+coords_2015 <- sf::st_coordinates(nei_2015_filtered_sf)
+
+nei_2015 <- nei_2015_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2015[, "Y"],
+    site_longitude = coords_2015[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  # create *new* fips columns with unique names to avoid collisions
+  dplyr::mutate(
+    fips_full_calc       = stringr::str_pad(as.character(`fips code`), 5, pad = "0"),
+    fips_state_code_calc = substr(fips_full_calc, 1, 2),
+    fips_code_calc       = substr(fips_full_calc, 3, 5),
+    data_set             = "2015NEI",
+    year                 = 2015
+  ) %>%
+  janitor::clean_names() %>%
+  # now rename using the **cleaned** names
+  dplyr::rename(
+    facility_id         = eis_facility_id,
+    pollutant_code      = pollutant_code  # already correct, kept for clarity
+  ) %>%
+  # carry the calculated fips columns to the standard names
+  dplyr::mutate(
+    fips_state_code = fips_state_code_calc,
+    fips_code       = fips_code_calc
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)) %>% dplyr::na_if("UNKNOWN"),
+    city      = stringr::str_to_upper(stringr::str_trim(city)) %>% dplyr::na_if(""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)) %>%
+                  stringr::str_replace(" Co$", " County") %>%
+                  dplyr::na_if("UNKNOWN"),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}") %>% dplyr::na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"), remove = FALSE, crs = 4326)
+
+print(nei_2015)
+```
+
+---
+
+### EPA NEI (2016)
+
+```{r NEI-2016}
+file_2016 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2016_NEI_Facility_summary",
+                  "2016_NEI_Facility_summary.csv")
+
+nei_2016_raw <- readr::read_csv(file_2016, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2016_filtered_sf <- nei_2016_raw %>%
+  dplyr::filter(`pollutant code` %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(`site latitude`),
+    longitude_msr = as.numeric(`site longitude`)
+  ) %>%
+  tidyr::drop_na(`site latitude`, `site longitude`, `total emissions`) %>%
+  dplyr::filter(
+    dplyr::between(`site latitude`, 18 , 72),
+    dplyr::between(`site longitude`, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("site longitude","site latitude"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(`total emissions`)
+
+coords_2016 <- sf::st_coordinates(nei_2016_filtered_sf)
+
+nei_2016 <- nei_2016_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2016[, "Y"],
+    site_longitude = coords_2016[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  # create *new* fips columns with unique names to avoid collisions
+  dplyr::mutate(
+    fips_full_calc       = stringr::str_pad(as.character(`fips code`), 5, pad = "0"),
+    fips_state_code_calc = substr(fips_full_calc, 1, 2),
+    fips_code_calc       = substr(fips_full_calc, 3, 5),
+    data_set             = "2016NEI",
+    year                 = 2016
+  ) %>%
+  janitor::clean_names() %>%
+  # now rename using the **cleaned** names
+  dplyr::rename(
+    facility_id         = eis_facility_id,
+    pollutant_code      = pollutant_code  # already correct, kept for clarity
+  ) %>%
+  # carry the calculated fips columns to the standard names
+  dplyr::mutate(
+    fips_state_code = fips_state_code_calc,
+    fips_code       = fips_code_calc
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)) %>% dplyr::na_if("UNKNOWN"),
+    city      = stringr::str_to_upper(stringr::str_trim(city)) %>% dplyr::na_if(""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)) %>%
+                  stringr::str_replace(" Co$", " County") %>%
+                  dplyr::na_if("UNKNOWN"),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}") %>% dplyr::na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"), remove = FALSE, crs = 4326)
+
+print(nei_2016)
+```
+
+---
+
+### EPA NEI (2017)
+
+```{r NEI-2017}
+file_2017 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2017_NEI_Facility_summary",
+                  "2017_NEI_Facility_summary.csv")
+
+nei_2017_raw <- readr::read_csv(file_2017, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2017_filtered_sf <- nei_2017_raw %>%
+  dplyr::filter(`pollutant code` %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(`site latitude`),
+    longitude_msr = as.numeric(`site longitude`)
+  ) %>%
+  tidyr::drop_na(`site latitude`, `site longitude`, `total emissions`) %>%
+  dplyr::filter(
+    dplyr::between(`site latitude`, 18 , 72),
+    dplyr::between(`site longitude`, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("site longitude","site latitude"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(`total emissions`)
+
+coords_2017 <- sf::st_coordinates(nei_2017_filtered_sf)
+
+nei_2017 <- nei_2017_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2017[, "Y"],
+    site_longitude = coords_2017[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  # create *new* fips columns with unique names to avoid collisions
+  dplyr::mutate(
+    fips_full_calc       = stringr::str_pad(as.character(`fips code`), 5, pad = "0"),
+    fips_state_code_calc = substr(fips_full_calc, 1, 2),
+    fips_code_calc       = substr(fips_full_calc, 3, 5),
+    data_set             = "2017NEI",
+    year                 = 2017
+  ) %>%
+  janitor::clean_names() %>%
+  # now rename using the **cleaned** names
+  dplyr::rename(
+    facility_id         = eis_facility_id,
+    pollutant_code      = pollutant_code  # already correct, kept for clarity
+  ) %>%
+  # carry the calculated fips columns to the standard names
+  dplyr::mutate(
+    fips_state_code = fips_state_code_calc,
+    fips_code       = fips_code_calc
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)) %>% dplyr::na_if("UNKNOWN"),
+    city      = stringr::str_to_upper(stringr::str_trim(city)) %>% dplyr::na_if(""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)) %>%
+                  stringr::str_replace(" Co$", " County") %>%
+                  dplyr::na_if("UNKNOWN"),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}") %>% dplyr::na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"), remove = FALSE, crs = 4326)
+
+print(nei_2017)
+```
+
+---
+
+### EPA NEI (2018)
+
+```{r NEI-2018}
+file_2018 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2018_NEI_Facility_summary",
+                  "2018_NEI_Facility_summary.csv")
+
+nei_2018_raw <- readr::read_csv(file_2018, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2018_filtered_sf <- nei_2018_raw %>%
+  dplyr::filter(`pollutant code` %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(`site latitude`),
+    longitude_msr = as.numeric(`site longitude`)
+  ) %>%
+  tidyr::drop_na(`site latitude`, `site longitude`, `total emissions`) %>%
+  dplyr::filter(
+    dplyr::between(`site latitude`, 18 , 72),
+    dplyr::between(`site longitude`, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("site longitude","site latitude"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(`total emissions`)
+
+coords_2018 <- sf::st_coordinates(nei_2018_filtered_sf)
+
+nei_2018 <- nei_2018_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2018[, "Y"],
+    site_longitude = coords_2018[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  # create *new* fips columns with unique names to avoid collisions
+  dplyr::mutate(
+    fips_full_calc       = stringr::str_pad(as.character(`fips code`), 5, pad = "0"),
+    fips_state_code_calc = substr(fips_full_calc, 1, 2),
+    fips_code_calc       = substr(fips_full_calc, 3, 5),
+    data_set             = "2018NEI",
+    year                 = 2018
+  ) %>%
+  janitor::clean_names() %>%
+  # now rename using the **cleaned** names
+  dplyr::rename(
+    facility_id         = eis_facility_id,
+    pollutant_code      = pollutant_code  # already correct, kept for clarity
+  ) %>%
+  # carry the calculated fips columns to the standard names
+  dplyr::mutate(
+    fips_state_code = fips_state_code_calc,
+    fips_code       = fips_code_calc
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)) %>% dplyr::na_if("UNKNOWN"),
+    city      = stringr::str_to_upper(stringr::str_trim(city)) %>% dplyr::na_if(""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)) %>%
+                  stringr::str_replace(" Co$", " County") %>%
+                  dplyr::na_if("UNKNOWN"),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}") %>% dplyr::na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"), remove = FALSE, crs = 4326)
+
+print(nei_2018)
+```
+
+---
+
+### EPA NEI (2019)
+
+```{r NEI-2019}
+file_2019 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2019_NEI_Facility_summary",
+                  "2019_NEI_Facility_summary.csv")
+
+nei_2019_raw <- readr::read_csv(file_2019, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2019_filtered_sf <- nei_2019_raw %>%
+  dplyr::filter(`pollutant code` %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(`site latitude`),
+    longitude_msr = as.numeric(`site longitude`)
+  ) %>%
+  tidyr::drop_na(`site latitude`, `site longitude`, `total emissions`) %>%
+  dplyr::filter(
+    dplyr::between(`site latitude`, 18 , 72),
+    dplyr::between(`site longitude`, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("site longitude","site latitude"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(`total emissions`)
+
+coords_2019 <- sf::st_coordinates(nei_2019_filtered_sf)
+
+nei_2019 <- nei_2019_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2019[, "Y"],
+    site_longitude = coords_2019[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  # create *new* fips columns with unique names to avoid collisions
+  dplyr::mutate(
+    fips_full_calc       = stringr::str_pad(as.character(`fips code`), 5, pad = "0"),
+    fips_state_code_calc = substr(fips_full_calc, 1, 2),
+    fips_code_calc       = substr(fips_full_calc, 3, 5),
+    data_set             = "2019NEI",
+    year                 = 2019
+  ) %>%
+  janitor::clean_names() %>%
+  # now rename using the **cleaned** names
+  dplyr::rename(
+    facility_id         = eis_facility_id,
+    pollutant_code      = pollutant_code  # already correct, kept for clarity
+  ) %>%
+  # carry the calculated fips columns to the standard names
+  dplyr::mutate(
+    fips_state_code = fips_state_code_calc,
+    fips_code       = fips_code_calc
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)) %>% dplyr::na_if("UNKNOWN"),
+    city      = stringr::str_to_upper(stringr::str_trim(city)) %>% dplyr::na_if(""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)) %>%
+                  stringr::str_replace(" Co$", " County") %>%
+                  dplyr::na_if("UNKNOWN"),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}") %>% dplyr::na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"), remove = FALSE, crs = 4326)
+
+print(nei_2019)
+```
+
+---
+
+### EPA NEI (2020)
+
+```{r NEI-2020}
+file_2020 <- here("Data","EPA_NEI_Facility_Summary_Data",
+                  "2020_NEI_Facility_summary",
+                  "2020_NEI_Facility_summary.csv")
+
+nei_2020_raw <- readr::read_csv(file_2020, show_col_types = FALSE)
+pollutants_of_interest <- c("NOX","SO2","NH3")
+
+nei_2020_filtered_sf <- nei_2020_raw %>%
+  dplyr::filter(`pollutant code` %in% pollutants_of_interest) %>%
+  dplyr::mutate(
+    latitude_msr  = as.numeric(`site latitude`),
+    longitude_msr = as.numeric(`site longitude`)
+  ) %>%
+  tidyr::drop_na(`site latitude`, `site longitude`, `total emissions`) %>%
+  dplyr::filter(
+    dplyr::between(`site latitude`, 18 , 72),
+    dplyr::between(`site longitude`, -180, -60)
+  ) %>%
+  sf::st_as_sf(coords = c("site longitude","site latitude"), crs = 4326) %>%
+  sf::st_filter(states_filtered, .predicate = sf::st_within) %>% 
+  drop_na(`total emissions`)
+
+coords_2020 <- sf::st_coordinates(nei_2020_filtered_sf)
+
+nei_2020 <- nei_2020_filtered_sf %>%
+  dplyr::mutate(
+    site_latitude  = coords_2020[, "Y"],
+    site_longitude = coords_2020[, "X"]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  # create *new* fips columns with unique names to avoid collisions
+  dplyr::mutate(
+    fips_full_calc       = stringr::str_pad(as.character(`fips code`), 5, pad = "0"),
+    fips_state_code_calc = substr(fips_full_calc, 1, 2),
+    fips_code_calc       = substr(fips_full_calc, 3, 5),
+    data_set             = "2020NEI",
+    year                 = 2020
+  ) %>%
+  janitor::clean_names() %>%
+  # now rename using the **cleaned** names
+  dplyr::rename(
+    facility_id         = eis_facility_id,
+    pollutant_code      = pollutant_code  # already correct, kept for clarity
+  ) %>%
+  # carry the calculated fips columns to the standard names
+  dplyr::mutate(
+    fips_state_code = fips_state_code_calc,
+    fips_code       = fips_code_calc
+  ) %>%
+  dplyr::mutate(
+    site_name = stringr::str_to_upper(stringr::str_trim(site_name)) %>% dplyr::na_if("UNKNOWN"),
+    city      = stringr::str_to_upper(stringr::str_trim(city)) %>% dplyr::na_if(""),
+    county    = stringr::str_to_upper(stringr::str_trim(county)) %>%
+                  stringr::str_replace(" Co$", " County") %>%
+                  dplyr::na_if("UNKNOWN"),
+    zip_code  = stringr::str_extract(zip_code, "\\d{5}") %>% dplyr::na_if("00000")
+  ) %>%
+  dplyr::select(
+    fips_state_code,
+    fips_code,
+    postal_abbreviation,
+    county,
+    facility_id,
+    site_name,
+    address,
+    zip_code,
+    city,
+    site_latitude,
+    site_longitude,
+    pollutant_code,
+    total_emissions,
+    emissions_uom,
+    data_set,
+    year
+  ) %>%
+  sf::st_as_sf(coords = c("site_longitude","site_latitude"), remove = FALSE, crs = 4326)
+
+print(nei_2020)
+```
+
+## Combining NEI Data (1990-2020)
+
+```{r NEI-combined}
+
+# Combine all NEI data from 1990 to 2020 into a single dataset
+
+nei_obj_names <- ls(pattern = "^nei_\\d{4}$")
+nei_list <- mget(nei_obj_names)
+
+# Combine all NEI data into a list 
+schema_cols_tbl <- c(
+  "fips_state_code", "fips_code", "postal_abbreviation", "county",
+  "facility_id", "site_name", "address", "zip_code", "city",
+  "site_latitude", "site_longitude",
+  "pollutant_code", "total_emissions", "emissions_uom", "data_set", "year"
+)
+
+coerce_and_order_tbl <- function(x) {
+  if (inherits(x, "sf")) x <- sf::st_drop_geometry(x)
+
+  x %>%
+    dplyr::mutate(across(where(haven::is.labelled), haven::zap_label)) %>%
+    dplyr::mutate(
+      dplyr::across(
+        c(fips_state_code, fips_code, postal_abbreviation, county,
+          facility_id, site_name, address, zip_code, city,
+          pollutant_code, emissions_uom, data_set),
+        ~ as.character(.)
+      ),
+      year            = as.integer(year),
+      total_emissions = as.numeric(total_emissions),
+      site_latitude   = as.numeric(site_latitude),
+      site_longitude  = as.numeric(site_longitude)
+    ) %>%
+    {  # add any missing columns as NA to match schema
+      missing <- setdiff(schema_cols_tbl, names(.))
+      if (length(missing)) {
+        dplyr::mutate(., !!!setNames(replicate(length(missing), NA, simplify = FALSE), missing))
+      } else .
+    } %>%
+    dplyr::select(all_of(schema_cols_tbl))
+}
+
+nei_tbls   <- purrr::map(nei_list, coerce_and_order_tbl)
+nei_all_tbl <- dplyr::bind_rows(nei_tbls) %>%
+  dplyr::arrange(year, postal_abbreviation, county, facility_id, pollutant_code)
+
+# Save CSV only
+sheets_dir <- here::here("Output", "Sheets")
+fs::dir_create(sheets_dir)
+
+readr::write_csv(nei_all_tbl,
+                 here::here(sheets_dir, "NEI_facility_summaries_1990_2020.csv"))
+
+```
+
+### NEI Emissions Distribution & Intensity (Facility Level)
+
+```{r NEI-distribution-intensity, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Facility Distribution/Intensity (2005-2020)."}
+
+# Facilities sf (sum by facility/year/pollutant, keep chosen years)
+years_keep <- c(2005, 2008, 2011, 2014, 2017, 2020)
+pols_keep  <- c("NOX","SO2","NH3")
+
+facility_sf <- nei_all_tbl %>%
+  filter(year %in% years_keep,
+         pollutant_code %in% pols_keep,
+         is.finite(site_longitude), is.finite(site_latitude)) %>%
+  group_by(year, pollutant_code, postal_abbreviation, county,
+           facility_id, site_latitude, site_longitude) %>%
+  summarise(total_emissions = sum(total_emissions, na.rm = TRUE),
+            .groups = "drop") %>%
+  st_as_sf(coords = c("site_longitude","site_latitude"), crs = 4326)
+
+# helper to return an expression for the chemical name
+chem_expr <- function(pol) {
+  switch(pol,
+    "NOX" = quote(NO[x]),
+    "SO2" = quote(SO[2]),
+    "NH3" = quote(NH[3]),
+    as.name(pol)             # fallback: print as-is
+  )
+}
+
+# Bubble plot
+bubble_plot <- function(df, pol, color,
+                        years      = years_keep,
+                        cap_pct    = 0.99,
+                        max_size   = 1,
+                        alpha      = 0.2,
+                        xlim       = c(-92.5, -72.5),
+                        ylim       = c(34, 44)) {
+  lab_short <- scales::label_number(scale_cut = scales::cut_short_scale())
+  df_pol <- df %>%
+    filter(pollutant_code == pol,
+           total_emissions > 0,
+           year %in% years) %>%
+    mutate(year = factor(year, levels = years))
+
+  if (!nrow(df_pol))
+    return(ggplot() + theme_void() + ggtitle(paste(pol, "- no data")))
+
+  upper <- as.numeric(quantile(df_pol$total_emissions, cap_pct, na.rm = TRUE))
+  lower <- min(df_pol$total_emissions[df_pol$total_emissions > 0], na.rm = TRUE)
+
+  df_pol <- df_pol %>%
+    mutate(total_emissions_plot = pmin(pmax(total_emissions, lower), upper))
+
+  brks <- scales::breaks_log(n = 5)(c(lower, upper))
+
+  ggplot() +
+    geom_sf(data = states_filtered, fill = NA, color = "grey20", linewidth = 0.2) +
+    geom_sf(data = df_pol,
+            aes(size = total_emissions_plot),
+            color = color, alpha = alpha, show.legend = TRUE) +
+    coord_sf(xlim = xlim, ylim = ylim, expand = FALSE, datum = NA) +
+    scale_size_continuous(
+      range  = c(0, max_size),
+      limits = c(lower, upper),
+      trans  = "log10",
+      breaks = brks,
+      labels = lab_short,
+      name   = "Emissions (tons, capped)"
+    ) +
+    facet_wrap(~ year, drop = FALSE) +
+    labs(
+      title    = bquote(.(chem_expr(pol)) ~ "Emissions by Facility (EPA NEI)"),
+      subtitle = "Distribution & Intensity (tons)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      legend.position = "bottom",
+      plot.title      = element_text(hjust = 0.5),
+      plot.subtitle   = element_text(hjust = 0.5),
+      panel.background  = element_rect(fill = NA, colour = NA),
+      plot.background   = element_rect(fill = NA, colour = NA),
+      legend.background = element_rect(fill = NA, colour = NA)
+    )
+}
+
+
+# Build the  plots
+p_so2_pts <- bubble_plot(facility_sf, "SO2", "royalblue1")
+p_nox_pts <- bubble_plot(facility_sf, "NOX", "orange")
+p_nh3_pts <- bubble_plot(facility_sf, "NH3", "orangered")
+
+print(p_so2_pts)
+print(p_nox_pts)
+print(p_nh3_pts)
+
+ggsave(here::here("Output", "Figures", "EPA_NEI_facility_SO2_distribution_intensity_2005_2020.png"),
+       p_so2_pts, width = 8, height = 6, dpi = 600)
+ggsave(here::here("Output", "Figures", "EPA_NEI_facility_NOX_distribution_intensity_2005_2020.png"),
+       p_nox_pts, width = 8, height = 6, dpi = 600)
+ggsave(here::here("Output", "Figures", "EPA_NEI_facility_NH3_distribution_intensity_2005_2020.png"),
+       p_nh3_pts, width = 8, height = 6, dpi = 600)
+
+```
+
+### Mapping NEI Data (Total Emissions)
+
+```{r mapping-nei-data, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="EPA NEI Facility-Level County Totals Map (1990-2020)."}
+
+# County–pollutant totals ACROSS ALL YEARS (pad FIPS -> GEOID)
+county_totals_pollutant <- nei_all_tbl %>%
+  mutate(
+    fips_state_code = str_pad(as.character(fips_state_code), 2, pad = "0"),
+    fips_code       = str_pad(as.character(fips_code),       3, pad = "0"),
+    geoid           = paste0(fips_state_code, fips_code)
+  ) %>%
+  group_by(geoid, fips_state_code, fips_code, pollutant_code) %>%
+  summarise(total_emissions = sum(total_emissions, na.rm = TRUE), .groups = "drop")
+
+# Write out 
+readr::write_csv(
+  county_totals_pollutant,
+  here::here(sheets_dir, "NEI_county_summaries_1990_2020.csv")
+)
+
+#  Pretty, parsed labels
+pollutant_label_map <- c(
+  NH3 = "NH[3]",
+  NOX = "NO[x]",
+  SO2 = "SO[2]"
+)
+
+# County polygons for 7 states
+counties_sf <- counties(state = states_of_interest, cb = TRUE, year = 2020, class = "sf") %>%
+  transmute(geoid = GEOID, geometry)
+
+# Join & clean
+county_map_df <- counties_sf %>%
+  left_join(county_totals_pollutant, by = "geoid") %>%
+  mutate(
+    pollutant_label = recode(pollutant_code, !!!pollutant_label_map, .default = NA_character_)
+  ) %>%
+  filter(!is.na(pollutant_label))
+
+# state outlines (store them)
+states_outline <- sf::st_transform(states_filtered, 4326)
+
+# computing map breaks 
+pos_vals <- county_map_df$total_emissions[
+  is.finite(county_map_df$total_emissions) & county_map_df$total_emissions > 0
+]
+rng <- range(pos_vals, na.rm = TRUE)
+if (!all(is.finite(rng))) rng <- c(1, 10)
+
+# function to return ~n powers of 10 between min/max
+log10_breaks <- function(rng, n = 7) {
+  lo <- floor(log10(rng[1]))
+  hi <- ceiling(log10(rng[2]))
+  if (lo == hi) hi <- lo + 1
+  exps <- unique(round(seq(lo, hi, length.out = n)))
+  10^exps
+}
+
+brks <- log10_breaks(rng, n = 5)
+
+lab_tons <- function(x) {
+  ifelse(x < 1,
+         formatC(x, format = "fg", digits = 2, drop0trailing = TRUE),
+         scales::comma(x)
+  )
+}
+
+# Plotting the map of county totals 
+ggplot(county_map_df) +
+  geom_sf(aes(fill = total_emissions), color = NA) +
+  facet_wrap(~ pollutant_label, ncol = 3, labeller = label_parsed) +
+  scale_fill_viridis_c(
+    option   = "C",
+    trans    = "log10",
+    breaks   = brks,
+    labels   = lab_tons(brks),   # <- no µ, m, k, M anymore
+    limits   = range(brks),
+    na.value = "grey95",
+    name     = "Emissions (Tons, log10)"
+  ) +
+  labs(
+    title    = "Facility Level Emissions by County, Total 1990–2020",
+    subtitle = "EPA NEI — Summed Facility Totals; IL, IN, KY, OH, PA, TN, WV",
+    caption  = "Projection: WGS84 / EPSG:4326"
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "top",
+    barwidth = unit(15, "cm"),
+    barheight = unit(0.4, "cm"),
+    ticks = FALSE
+  )) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid       = element_blank(),
+    axis.title       = element_blank(),
+    strip.background = element_rect(fill = NA, color = NA),
+    strip.text       = element_text(face = "bold"),
+    legend.position  = "bottom",
+    legend.title     = element_text(margin = margin(b = 4)),
+    panel.background  = element_rect(fill = NA, colour = NA),
+    plot.background   = element_rect(fill = NA, colour = NA),
+    legend.background = element_rect(fill = NA, colour = NA))
+
+```
+
+### Visualzing NEI Trends (Emissions/Time)
+
+```{r visualizing_nei_trends, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="EPA NEI Facility-Level State Totals Trend (1990-2020)."}
+
+# Aggregate tostate x year x pollutant
+state_year_pollutant <- nei_all_tbl %>%
+  filter(postal_abbreviation %in% states_of_interest) %>%
+  group_by(postal_abbreviation, year, pollutant_code) %>%
+  summarise(total_emissions = sum(total_emissions, na.rm = TRUE), .groups = "drop")
+
+#  Nice parsed labels for titles
+pollutant_label_map <- c(
+  NH3 = "NH[3]",
+  NOX = "NO[x]",
+  SO2 = "SO[2]"
+)
+
+# Palette (one color per state)
+pal_states <- scales::hue_pal()(length(states_of_interest))
+names(pal_states) <- states_of_interest
+
+## NH3 Plot 
+df_nh3 <- state_year_pollutant %>% filter(pollutant_code == "NH3")
+
+p_nh3 <- ggplot(df_nh3,
+                aes(x = year, y = total_emissions,
+                    color = postal_abbreviation, group = postal_abbreviation)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.1) +
+  scale_color_manual(values = pal_states, name = "State") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = expression("Total State Emissions Over Time: " * NH[3]),
+    subtitle = "EPA NEI Facility Totals; IL, IN, KY, OH, PA, TN, WV",
+    x = NULL, y = "Emissions (Tons)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "bottom",
+        panel.background  = element_rect(fill = NA, colour = NA),
+        plot.background   = element_rect(fill = NA, colour = NA),
+        legend.background = element_rect(fill = NA, colour = NA))
+
+print(p_nh3)
+
+## NOX Plot
+df_nox <- state_year_pollutant %>% filter(pollutant_code == "NOX")
+
+p_nox <- ggplot(df_nox,
+                aes(x = year, y = total_emissions,
+                    color = postal_abbreviation, group = postal_abbreviation)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.1) +
+  scale_color_manual(values = pal_states, name = "State") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = expression("Total State Emissions Over Time: " * NO[x]),
+    subtitle = "EPA NEI Facility Totals; IL, IN, KY, OH, PA, TN, WV",
+    x = NULL, y = "Emissions (Tons)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "bottom",
+        panel.background  = element_rect(fill = NA, colour = NA),
+        plot.background   = element_rect(fill = NA, colour = NA),
+        legend.background = element_rect(fill = NA, colour = NA))
+
+print(p_nox)
+
+## SO2 Plot
+df_so2 <- state_year_pollutant %>% filter(pollutant_code == "SO2")
+
+p_so2 <- ggplot(df_so2,
+                aes(x = year, y = total_emissions,
+                    color = postal_abbreviation, group = postal_abbreviation)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.1) +
+  scale_color_manual(values = pal_states, name = "State") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = expression("Total State Emissions Over Time: " * SO[2]),
+    subtitle = "EPA NEI Facility Totals; IL, IN, KY, OH, PA, TN, WV",
+    x = NULL, y = "Emissions (Tons)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "bottom",
+        panel.background  = element_rect(fill = NA, colour = NA),
+        plot.background   = element_rect(fill = NA, colour = NA),
+        legend.background = element_rect(fill = NA, colour = NA))
+
+print(p_so2)
+
+ggsave(here::here("Output", "Figures", "EPA_NEI_state_trends_NOx_1990_2020.png"),
+       p_nox, width = 7.5, height = 5, dpi = 600)
+ggsave(here::here("Output", "Figures", "EPA_NEI_state_trends_SO2_1990_2020.png"),
+       p_so2, width = 7.5, height = 5, dpi = 600)
+ggsave(here::here("Output", "Figures", "EPA_NEI_state_trends_NH3_1990_2020.png"),
+       p_nh3, width = 7.5, height = 5, dpi = 600)
+
+```
