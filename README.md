@@ -2,17 +2,17 @@
 
 ---
 
-<table align="center" border="0" cellspacing="0" cellpadding="0">
-  <tr>
-    <td align="right" valign="middle">
+<table align="center" style="border-collapse: collapse; border: none;">
+  <tr style="border: none;">
+    <td align="right" valign="middle" style="border: none;">
       <a href="https://criticalecology.org">
         <img src="Figures/CEL_Logo.png" alt="Critical Ecology Lab Logo" width="220">
       </a>
     </td>
-    <td align="center" valign="middle" style="padding:0 10px;">
+    <td align="center" valign="middle" style="border: none; padding:0 10px;">
       <span style="font-size:28px;">×</span>
     </td>
-    <td align="left" valign="middle">
+    <td align="left" valign="middle" style="border: none;">
       <a href="https://hubbardbrook.org">
         <img src="Figures/HBES_Logo.png" alt="Hubbard Brook Logo" width="300">
       </a>
