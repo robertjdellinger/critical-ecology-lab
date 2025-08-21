@@ -2,15 +2,15 @@
 
 ---
 
-<table align="center">
+<table align="center" border="0" cellspacing="0" cellpadding="0">
   <tr>
     <td align="right" valign="middle">
       <a href="https://criticalecology.org">
         <img src="Figures/CEL_Logo.png" alt="Critical Ecology Lab Logo" width="220">
       </a>
     </td>
-    <td align="center" valign="middle">
-      <h3 style="margin:0;">&times;</h3>
+    <td align="center" valign="middle" style="padding:0 10px;">
+      <span style="font-size:28px;">×</span>
     </td>
     <td align="left" valign="middle">
       <a href="https://hubbardbrook.org">
