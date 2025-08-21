@@ -2,15 +2,23 @@
 
 ---
 
-<p align="center">
-  <a href="https://criticalecology.org" target="_blank">
-    <img src="Figures/CEL_Logo.png" alt="Critical Ecology Lab Logo" width="220"/>
-  </a>
-  <span style="font-size:32px;">×  </span>
-  <a href="https://hubbardbrook.org" target="_blank">
-    <img src="Figures/HBES_Logo.png" alt="Hubbard Brook Logo" width="300"/>
-  </a>
-</p>
+<table align="center">
+  <tr>
+    <td align="right" valign="middle">
+      <a href="https://criticalecology.org">
+        <img src="Figures/CEL_Logo.png" alt="Critical Ecology Lab Logo" width="220">
+      </a>
+    </td>
+    <td align="center" valign="middle">
+      <h3 style="margin:0;">&times;</h3>
+    </td>
+    <td align="left" valign="middle">
+      <a href="https://hubbardbrook.org">
+        <img src="Figures/HBES_Logo.png" alt="Hubbard Brook Logo" width="300">
+      </a>
+    </td>
+  </tr>
+</table>
 
 
 # Socio-Economic Drivers of Acid Rain Research Project
